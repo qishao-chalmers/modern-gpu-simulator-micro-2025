@@ -32,6 +32,11 @@ fi
 export PATH=`echo $PATH | sed "s#$GPGPUSIM_ROOT/bin:$CUDA_INSTALL_PATH/bin:##"`
 export PATH=$GPGPUSIM_ROOT/bin:$CUDA_INSTALL_PATH/bin:$PATH
 
+# Clusters often lack makedepend (xutils); use bundled no-op stub when needed.
+if ! command -v makedepend >/dev/null 2>&1; then
+	export PATH=$GPGPUSIM_ROOT/build-tools/bin:$PATH
+fi
+
 # to run the debug build of GPGPU-Sim run:
 # source setup_environment debug
 NVCC_PATH=`which nvcc`;
@@ -44,7 +49,14 @@ if [ $? = 1 ]; then
 	return;
 fi
 
-CC_VERSION=`gcc --version | head -1 | awk '{for(i=1;i<=NF;i++){ if(match($i,/^[0-9]\.[0-9]\.[0-9]$/))  {print $i; exit 0}}}'`
+CC_VERSION=`${CC:-gcc} --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1`
+if [ -z "$CC_VERSION" ]; then
+	CC_VERSION=`${CXX:-g++} --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1`
+fi
+if [ -z "$CC_VERSION" ]; then
+	echo "ERROR ** Could not detect GCC version (CC=${CC:-gcc})";
+	return;
+fi
 
 CUDA_VERSION_STRING=`$CUDA_INSTALL_PATH/bin/nvcc --version | awk '/release/ {print $5;}' | sed 's/,//'`;
 export CUDA_VERSION_NUMBER=`echo $CUDA_VERSION_STRING | sed 's/\./ /' | awk '{printf("%02u%02u", 10*int($1), 10*$2);}'`
@@ -92,8 +104,8 @@ if [ `uname` = "Darwin" ]; then
 	export DYLD_LIBRARY_PATH=`echo $DYLD_LIBRARY_PATH | sed -Ee 's#'$GPGPUSIM_ROOT'\/lib\/[0-9]+\/(debug|release):##'`
 	export DYLD_LIBRARY_PATH=$GPGPUSIM_ROOT/lib/$GPGPUSIM_CONFIG:$DYLD_LIBRARY_PATH
 else
-	export LD_LIBRARY_PATH=`echo $LD_LIBRARY_PATH | sed -re 's#'$GPGPUSIM_ROOT'\/lib\/[0-9]+\/(debug|release):##'`
-	export LD_LIBRARY_PATH=$GPGPUSIM_ROOT/lib/$GPGPUSIM_CONFIG:$LD_LIBRARY_PATH
+	export LD_LIBRARY_PATH=`echo ${LD_LIBRARY_PATH:-} | sed -re 's#'$GPGPUSIM_ROOT'\/lib\/[0-9]+\/(debug|release):##'`
+	export LD_LIBRARY_PATH=$GPGPUSIM_ROOT/lib/$GPGPUSIM_CONFIG:${LD_LIBRARY_PATH:-}
 fi
 
 
@@ -107,7 +119,7 @@ if [ `uname` = "Darwin" ]; then
 else
 	HOSTNAME_DOMAIN=`hostname -d`
 fi
-if [ "x$HOSTNAME_DOMAIN" = "xece.ubc.ca" -a "$OPENCL_REMOTE_GPU_HOST" = "" ]; then
+if [ "x$HOSTNAME_DOMAIN" = "xece.ubc.ca" -a "${OPENCL_REMOTE_GPU_HOST:-}" = "" ]; then
 	export OPENCL_REMOTE_GPU_HOST=aamodt-pc05.ece.ubc.ca
 fi
 HOSTNAME_F=`hostname -f`

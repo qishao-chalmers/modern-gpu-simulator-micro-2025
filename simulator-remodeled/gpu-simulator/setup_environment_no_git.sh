@@ -25,8 +25,23 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Default CUDA path when not set (Debian/Ubuntu packages install headers under /usr)
+if [ -z "$CUDA_INSTALL_PATH" ]; then
+    if [ -d "/usr/local/cuda" ]; then
+        export CUDA_INSTALL_PATH=/usr/local/cuda
+    elif [ -x "/usr/bin/nvcc" ]; then
+        export CUDA_INSTALL_PATH=/usr
+    fi
+fi
+
+# Prefer g++-10 with CUDA 11.x (g++-11 can fail with nvcc 11.5)
+if [ -z "$CXX" ] && command -v g++-10 >/dev/null 2>&1; then
+    export CXX=g++-10
+    export CC=gcc-10
+fi
+
 # MOD. to pick the right compiler
-if [ $IS_SERT = '1' ] ; then
+if [ "${IS_SERT:-0}" = '1' ] ; then
     # VERSION=9.3.0
     # DIR=/Soft/gcc/$VERSION
     # export CC=$DIR/bin/gcc

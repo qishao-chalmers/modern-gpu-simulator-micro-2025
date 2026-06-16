@@ -1,4 +1,5 @@
 CC=g++
+CXX=g++
 MKDIR_P = mkdir -p
 
 ODIR=obj
@@ -16,8 +17,9 @@ TRACES_ENHANCED_PROTO_DIR=dynamic_trace
 TRACES_ENHANCED_DIR=.
 TRACES_ENHANCED_OBJ=$(wildcard $(TRACES_ENHANCED_DIR)/obj/*.o)
 
-# Protocol Buffer setup
-PROTOC=protoc
+include ../protobuf_deps.mk
+
+# Protocol Buffer setup (PROTOC resolved in protobuf_deps.mk from pkg-config prefix)
 PROTO_FILES=$(wildcard $(TRACES_ENHANCED_PROTO_DIR)/*.proto)
 
 # Define directories for generated files
@@ -26,26 +28,19 @@ PROTO_SRC_DIR=$(PROTO_GEN_DIR)/src
 PROTO_HDR_DIR=$(PROTO_GEN_DIR)/include
 PROTO_OBJ_DIR=$(PROTO_GEN_DIR)/obj
 
-# Add protobuf includes and libraries
-PROTOBUF_INCLUDES=-I/usr/local/include
-PROTOBUF_LIBS=-L/usr/local/lib -lprotobuf
+PROTOBUF_INCLUDES_FROM_DEPS := $(PROTOBUF_INCLUDES)
 
 # Create directory structure if it doesn't exist
 $(shell mkdir -p $(PROTO_SRC_DIR) $(PROTO_HDR_DIR) $(PROTO_OBJ_DIR))
 
-# Define path transformations for proto files
 PROTO_SRCS=$(patsubst $(TRACES_ENHANCED_PROTO_DIR)/%.proto,$(PROTO_SRC_DIR)/%.pb.cc,$(PROTO_FILES))
 PROTO_HDRS=$(patsubst $(TRACES_ENHANCED_PROTO_DIR)/%.proto,$(PROTO_HDR_DIR)/%.pb.h,$(PROTO_FILES))
 PROTO_OBJS=$(patsubst $(PROTO_SRC_DIR)/%.pb.cc,$(PROTO_OBJ_DIR)/%.pb.o,$(PROTO_SRCS))
 
-# Add includes for generated headers
-INCLUDES+=$(PROTOBUF_INCLUDES) -I$(TRACES_ENHANCED_DIR) -I$(PROTO_HDR_DIR)
-LIBS+=$(PROTOBUF_LIBS)
+INCLUDES+=$(PROTOBUF_INCLUDES_FROM_DEPS) -I$(TRACES_ENHANCED_DIR) -I$(PROTO_HDR_DIR)
+LIBS+=$(PROTOBUF_LIBS) -lz -pthread
 
-
-CFLAGS=$(CXXFLAGS) -I$(CUDA_INSTALL_PATH)/include -fPIC
-
-LIBS=-lz -pthread
+CFLAGS=$(CXXFLAGS) $(PROTOBUF_COMPILE_FLAGS) $(INCLUDES) -fPIC
 
 SOURCES := $(shell find $(SRCDIR) -name '*.cc')
 OBJ := $(patsubst $(SRCDIR)/%,$(ODIR)/%,$(SOURCES:.cc=.o))
@@ -59,7 +54,7 @@ directories: ${ODIR}
 ${ODIR}:
 	${MKDIR_P} ${ODIR}
 
-depend: $(OBJ)
+depend: protobuf $(OBJ)
 
 $(ODIR)/%.o: $(SRCDIR)/%.cc
 	$(CC) -c -o $@ $< $(CFLAGS)
@@ -70,13 +65,11 @@ $(PROTO_SRC_DIR)/%.pb.cc $(PROTO_HDR_DIR)/%.pb.h: $(TRACES_ENHANCED_PROTO_DIR)/%
 	@mv $(PROTO_SRC_DIR)/$*.pb.h $(PROTO_HDR_DIR)/$*.pb.h
 
 $(PROTO_OBJ_DIR)/%.pb.o: $(PROTO_SRC_DIR)/%.pb.cc $(PROTO_HDR_DIR)/%.pb.h
-	$(CXX) -c $(INCLUDES) $(PROTOBUF_INCLUDES) -fPIC -o $@ $<
-
+	$(CXX) -c -o $@ $< $(CFLAGS)
 
 # Generate Protocol Buffer files
 protobuf: $(PROTO_SRCS) $(PROTO_HDRS) $(PROTO_OBJS)
 	@echo "Protocol buffer files generated"
-# MOD. End. ENHANCED TRACES
 
 clean:
 	rm -rf $(ODIR)

@@ -1,0 +1,15 @@
+---
+description: Do not remove user or tracer debug print/logging code during refactors
+alwaysApply: true
+---
+
+# Preserve debug print instrumentation
+
+When editing this repo (especially `simulator-remodeled/util/tracer_nvbit/tracer_tool/tracer_tool.cu` and related tracer scripts):
+
+- **Do not delete** debug logging added for troubleshooting (e.g. `ENHANCED_LOG`, `TRACE_LOG`, `fprintf(stderr, ...)`, `TOOL_VERBOSE` paths, `Tracer:` / `[enhanced_tracer]` messages, startup/shutdown markers).
+- Refactors may **move or extend** logging, but must **keep existing debug output** unless the user explicitly asks to remove or reduce verbosity.
+- If a log must change for correctness (e.g. fix a format string or path), keep the same diagnostic intent—do not silently drop the message.
+- Prefer appending new logs over replacing old ones when both are useful.
+
+The user relies on these prints on remote cluster runs where tracing failures are hard to reproduce.

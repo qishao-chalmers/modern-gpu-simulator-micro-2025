@@ -1,5 +1,11 @@
-NVCC=nvcc -ccbin=$(CXX) -D_FORCE_INLINES
+# Host compiler for NVCC (ignore cross-compilers like riscv in $CXX)
+HOST_CXX ?= $(shell command -v g++-10 2>/dev/null || command -v g++ 2>/dev/null || echo g++)
+HOST_CC ?= $(shell command -v gcc-10 2>/dev/null || command -v gcc 2>/dev/null || echo gcc)
+NVCC=nvcc -ccbin=$(HOST_CXX) -D_FORCE_INLINES
 PTXAS=ptxas
+
+CUDA_INSTALL_PATH ?= /usr/local/cuda
+CUDA_INC=-I$(CUDA_INSTALL_PATH)/include
 
 DEBUG_TOOL?=0
 
@@ -31,7 +37,7 @@ else
 endif
 
 NVBIT_PATH=../nvbit_release/core
-INCLUDES=-I$(NVBIT_PATH)
+INCLUDES=-I$(NVBIT_PATH) $(CUDA_INC)
 
 LIBS=-L$(NVBIT_PATH) -lnvbit
 NVCC_PATH=-L $(subst bin/nvcc,lib64,$(shell which nvcc | tr -s /))
@@ -46,7 +52,6 @@ ARCH_VER_CHECK=$(shell echo "${NVCC_VER} >= $(ARCH_VER_REQ)" | bc)
 
 ifeq ($(ARCH_VER_CHECK),0)
 ifeq ($(ARCH), all)
-$(shell echo "${ARCH}, ${ARCH_VER_CHECK}, ${NVCC_VER}" )
 $(error ERROR: ARCH environment variable must be set to "sm_XX" for nvcc < 11.7, ex: run "export ARCH=sm_70 for compute capability 70")
 endif
 endif
@@ -62,13 +67,16 @@ TRACES_ENHANCED_PROTOCOL_BUFFER_DIR=../../traces_enhanced/pb_trace
 TRACES_ENHANCED_OBJ=$(wildcard $(TRACES_ENHANCED_DIR)/obj/*.o)
 TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ=$(wildcard $(TRACES_ENHANCED_PROTOCOL_BUFFER_DIR)/obj/*.o)
 TRACE_PRINTER = trace_printer
+ASSEMBLE_DYNAMIC_TRACE = assemble_dynamic_trace
 # MOD. End. ENHANCED TRACES
 
+include ../../protobuf_deps.mk
+INCLUDES += $(PROTOBUF_INCLUDES)
 
-all: traces_enhanced $(NVBIT_TOOL) trace_printer
+all: traces_enhanced $(NVBIT_TOOL) trace_printer assemble_dynamic_trace
 
 $(NVBIT_TOOL): $(OBJECTS) $(NVBIT_PATH)/libnvbit.a traces_enhanced
-	$(NVCC) -arch=$(ARCH) $(OPTFLAGS) $(OBJECTS) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static -lprotobuf -shared -o $@
+	$(NVCC) -arch=$(ARCH) $(OPTFLAGS) $(OBJECTS) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static $(PROTOBUF_LIBS) -shared -o $@
 
 %.o: %.cu common.h
 	$(NVCC) -dc -c -std=c++17 $(INCLUDES) -Xptxas -cloning=no -Xcompiler -Wall -arch=$(ARCH) $(OPTFLAGS) -Xcompiler -fPIC $< -o $@
@@ -78,14 +86,17 @@ inject_funcs.o: inject_funcs.cu common.h
 
 # MOD. Begin. ENHANCED TRACES
 traces_enhanced:
-	$(MAKE) -C $(TRACES_ENHANCED_DIR)
+	$(MAKE) -C $(TRACES_ENHANCED_DIR) CXX=$(HOST_CXX) CC=$(HOST_CC)
 # MOD. End. ENHANCED TRACES
 
 # Build the trace_printer executable
 # First compile trace_printer's code into a shared library
 trace_printer: traces_enhanced
-	$(NVCC) -std=c++17 $(OPTFLAGS) -o $(TRACE_PRINTER) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) trace_printer.cc -lprotobuf
+	$(NVCC) -std=c++17 $(OPTFLAGS) -o $(TRACE_PRINTER) $(TRACES_ENHANCED_OBJ) $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) trace_printer.cc $(PROTOBUF_LIBS)
+
+assemble_dynamic_trace: traces_enhanced
+	$(HOST_CXX) -std=c++17 $(OPTFLAGS) -o $(ASSEMBLE_DYNAMIC_TRACE) assemble_dynamic_trace.cc $(TRACES_ENHANCED_PROTOCOL_BUFFER_OBJ) $(PROTOBUF_LIBS) $(PROTOBUF_INCLUDES)
 
 clean:
-	rm -f *.so *.o trace_printer
+	rm -f *.so *.o trace_printer assemble_dynamic_trace
 	$(MAKE) clean -C $(TRACES_ENHANCED_DIR)

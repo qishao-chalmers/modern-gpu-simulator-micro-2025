@@ -122,6 +122,11 @@ bool *stop_report;
 uint32_t instr_begin_interval = 0;
 uint32_t instr_end_interval = UINT32_MAX;
 int verbose = 0;
+#define TRACE_LOG(...)                                                         \
+  do {                                                                         \
+    if (verbose)                                                               \
+      printf(__VA_ARGS__);                                                     \
+  } while (0)
 int intermediate_extra_files_persistance = 0;
 int gather_registers = 0;
 int enable_compress = 1;
@@ -133,6 +138,7 @@ bool active_region = true;
 
 /* Should we terminate the program once we are done tracing? */
 int terminate_after_limit_number_of_kernels_reached = 0;
+int tracer_skip_cubin_dump = 0;
 int user_defined_folders = 0;
 
 /* opcode to id map and reverse map  */
@@ -153,6 +159,10 @@ enum address_format { list_all = 0, base_stride = 1, base_delta = 2 };
 int binary_version;
 std::vector<int> kernel_id;
 std::vector<int> current_stream_id;
+/* Kernels instrumented since last cudaGraphLaunch flush (CUDA graph workloads). */
+std::vector<int> traced_kernels_since_graph_launch;
+/* Defer TERMINATE_UPON_LIMIT until after cudaGraphLaunch flush (CUDA graphs). */
+std::vector<bool> pending_terminate_after_graph;
 
 // MOD. Begin. Enhanced Tracer
 int next_candidate_unique_function_id = 0;
@@ -207,6 +217,8 @@ std::map<std::string, uint64_t> map_kernel_name_to_func_addr;
 
 traced_execution *m_enhanced_traced_execution;
 std::string traces_path = "traces";
+/* Absolute path to traces/ resolved at first CUDA callback (current cwd). */
+static std::string traces_output_abs;
 std::string extrainfo_path = traces_path + "/extra_info";
 std::string cubin_path = extrainfo_path + "/cubin";
 std::string sass_path = extrainfo_path + "/sass";
@@ -266,6 +278,49 @@ void create_folder(const char * folder_path) {
 
 void remove_folder(const char * folder_path) {
   std::filesystem::remove_all(folder_path);
+}
+
+static void ensure_traces_output_abs() {
+  if (!traces_output_abs.empty()) {
+    return;
+  }
+  char *wd = getcwd(NULL, 0);
+  traces_output_abs = std::string(wd) + "/" + traces_path;
+  free(wd);
+}
+
+static std::string trace_abs_path(const std::string &rel_under_traces) {
+  ensure_traces_output_abs();
+  return traces_output_abs + "/" + rel_under_traces;
+}
+
+#define ENHANCED_LOG(...)                                                        \
+  do {                                                                         \
+    fprintf(stderr, "[enhanced_tracer] ");                                      \
+    fprintf(stderr, __VA_ARGS__);                                              \
+    fflush(stderr);                                                            \
+  } while (0)
+
+static void log_directory_contents(const char *label, const std::string &dir_path) {
+  ENHANCED_LOG("%s: %s", label, dir_path.c_str());
+  if (!std::filesystem::exists(dir_path)) {
+    ENHANCED_LOG("  -> directory does not exist\n");
+    return;
+  }
+  int nfiles = 0;
+  int ndirs = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(dir_path)) {
+    if (entry.is_regular_file()) {
+      ENHANCED_LOG("  file: %s (%lld bytes)\n",
+                   entry.path().filename().string().c_str(),
+                   (long long)std::filesystem::file_size(entry.path()));
+      nfiles++;
+    } else if (entry.is_directory()) {
+      ENHANCED_LOG("  dir:  %s/\n", entry.path().filename().string().c_str());
+      ndirs++;
+    }
+  }
+  ENHANCED_LOG("  -> %d file(s), %d subdir(s)\n", nfiles, ndirs);
 }
 
 std::string read_stripped_line(std::ifstream &ifs) {
@@ -360,7 +415,9 @@ bool has_the_kernel_been_traced(std::string kernel_name, std::map<int, std::stri
 }
 
 void parse_sass(int binary_version, const std::filesystem::directory_entry &entry) {
-  std::string absolute_sass_path = cwd + "/" + sass_path;
+  std::string absolute_sass_path = traces_output_abs.empty()
+                                       ? cwd + "/" + sass_path
+                                       : trace_abs_path("extra_info/sass");
   std::string sass_file = absolute_sass_path + "/" + entry.path().stem().string() + ".sass";
   std::ifstream ifs_sass; // input file stream
   ifs_sass.open(sass_file, std::ios::in);
@@ -506,7 +563,9 @@ void parse_rfu_instruction_info(std::vector<std::string> splitted_text, std::vec
 }
 
 void parse_rfu(const std::filesystem::directory_entry &entry) {
-  std::string absolute_rfu_path = cwd + "/" + register_usage_path;
+  std::string absolute_rfu_path = traces_output_abs.empty()
+                                      ? cwd + "/" + register_usage_path
+                                      : trace_abs_path("extra_info/register_usage");
   std::string rfu_file = absolute_rfu_path + "/" + entry.path().stem().string() + ".rfu";
   std::ifstream ifs_rfu; // input file stream
   ifs_rfu.open(rfu_file, std::ios::in);
@@ -611,6 +670,13 @@ void nvbit_at_init() {
               "write the core id in the traces");
   GET_VAR_INT(terminate_after_limit_number_of_kernels_reached, "TERMINATE_UPON_LIMIT", 0, 
               "Stop the process once the current kernel > DYNAMIC_KERNEL_LIMIT_END");
+  GET_VAR_INT(tracer_skip_cubin_dump, "TRACER_SKIP_CUBIN_DUMP", 0,
+              "Skip cuobjdump/nvdisasm on CUDA binary; build enhanced_execution_info.json "
+              "from NVBit-captured SASS only (recommended for llama.cpp + kernel limits)");
+  if (getenv("TRACER_CUDA_BINARY") != nullptr) {
+    printf("TRACER_CUDA_BINARY=%s (cuobjdump target for enhanced traces)\n",
+           getenv("TRACER_CUDA_BINARY"));
+  }
   GET_VAR_INT(user_defined_folders, "USER_DEFINED_FOLDERS", 0, "Uses the user defined "
               "folder TRACES_FOLDER path environment");
   GET_VAR_INT(threshold_unique_kernel_checking, "THRESHOLD_UNIQUE_KERNEL_CHECKING", 10,
@@ -618,6 +684,9 @@ void nvbit_at_init() {
   GET_VAR_INT(gather_registers, "GATHER_REGISTERS", 0, "Enable gathering of GPU register values. Not available in this version.");
   std::string pad(100, '-');
   printf("%s\n", pad.c_str());
+  fprintf(stderr,
+          "NVBit tracer: [enhanced_tracer] logs go to stderr (always on). "
+          "Set TOOL_VERBOSE=1 for per-kernel launch logs.\n");
 
   if (active_from_start == 0) {
     active_region = false;
@@ -976,6 +1045,453 @@ static unsigned int pending_devices_to_finish = 0;
 unsigned old_total_insts = 0;
 unsigned old_total_reported_insts = 0;
 
+static void serialize_threadblocks_for_device(int device_id, int kernel_id_filter);
+static void finalize_kernel_launch_after_exec(CUcontext ctx, CTXstate *ctx_state,
+                                              int device_id,
+                                              unsigned completed_kernel_id,
+                                              cudaStream_t cuda_stream,
+                                              bool serialize_all_pending_tbs);
+static void write_dynamic_trace_checkpoint();
+static void finalize_cuda_graph_launch(CUcontext ctx, CTXstate *ctx_state,
+                                       cudaStream_t cuda_stream);
+
+void enhanced_tracer();
+
+static void finalize_trace_outputs_and_exit() {
+  fprintf(stderr, "Tracer: finalize_trace_outputs_and_exit (TERMINATE_UPON_LIMIT)\n");
+  fflush(stderr);
+  write_dynamic_trace_checkpoint();
+  if (dyn_trace.gpu_device_size() > 0 ||
+      !all_kernels_key_instructions_by_pc.empty()) {
+    fprintf(stderr,
+            "Tracer: calling enhanced_tracer (dyn_trace devices=%d, kernel "
+            "groups=%zu)\n",
+            dyn_trace.gpu_device_size(),
+            all_kernels_key_instructions_by_pc.size());
+    fflush(stderr);
+    enhanced_tracer();
+  } else {
+    fprintf(stderr,
+            "Tracer: skipping enhanced_tracer (no dyn_trace and no "
+            "instrumented kernels in memory)\n");
+    fflush(stderr);
+  }
+  fflush(stdout);
+  exit(0);
+}
+
+static bool is_stream_capturing(CUstream stream) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  cudaStream_t cuda_stream = stream ? reinterpret_cast<cudaStream_t>(stream) : 0;
+  if (cudaStreamIsCapturing(cuda_stream, &status) != cudaSuccess) {
+    return false;
+  }
+  return status == cudaStreamCaptureStatusActive;
+}
+
+struct KernelLaunchConfig {
+  CUfunction f;
+  CUstream hStream;
+  unsigned gridDimX;
+  unsigned gridDimY;
+  unsigned gridDimZ;
+  unsigned blockDimX;
+  unsigned blockDimY;
+  unsigned blockDimZ;
+  unsigned sharedMemBytes;
+};
+
+static bool extract_launch_config(nvbit_api_cuda_t cbid, void *params,
+                                  KernelLaunchConfig &cfg) {
+  if (cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
+      cbid == API_CUDA_cuLaunchKernelEx) {
+    cuLaunchKernelEx_params *p = (cuLaunchKernelEx_params *)params;
+    cfg.f = p->f;
+    cfg.hStream = p->config->hStream;
+    cfg.gridDimX = p->config->gridDimX;
+    cfg.gridDimY = p->config->gridDimY;
+    cfg.gridDimZ = p->config->gridDimZ;
+    cfg.blockDimX = p->config->blockDimX;
+    cfg.blockDimY = p->config->blockDimY;
+    cfg.blockDimZ = p->config->blockDimZ;
+    cfg.sharedMemBytes = p->config->sharedMemBytes;
+    return true;
+  }
+  if (cbid == API_CUDA_cuGraphAddKernelNode) {
+    cuGraphAddKernelNode_params *p = (cuGraphAddKernelNode_params *)params;
+    cuLaunchKernel_params *lp = (cuLaunchKernel_params *)p->nodeParams;
+    cfg.f = lp->f;
+    cfg.hStream = lp->hStream;
+    cfg.gridDimX = lp->gridDimX;
+    cfg.gridDimY = lp->gridDimY;
+    cfg.gridDimZ = lp->gridDimZ;
+    cfg.blockDimX = lp->blockDimX;
+    cfg.blockDimY = lp->blockDimY;
+    cfg.blockDimZ = lp->blockDimZ;
+    cfg.sharedMemBytes = lp->sharedMemBytes;
+    return true;
+  }
+  if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
+      cbid == API_CUDA_cuLaunchKernel ||
+      cbid == API_CUDA_cuLaunchCooperativeKernel_ptsz ||
+      cbid == API_CUDA_cuLaunchCooperativeKernel ||
+      cbid == API_CUDA_cuLaunchGridAsync) {
+    cuLaunchKernel_params *p = (cuLaunchKernel_params *)params;
+    cfg.f = p->f;
+    cfg.hStream = p->hStream;
+    cfg.gridDimX = p->gridDimX;
+    cfg.gridDimY = p->gridDimY;
+    cfg.gridDimZ = p->gridDimZ;
+    cfg.blockDimX = p->blockDimX;
+    cfg.blockDimY = p->blockDimY;
+    cfg.blockDimZ = p->blockDimZ;
+    cfg.sharedMemBytes = p->sharedMemBytes;
+    return true;
+  }
+  return false;
+}
+
+static bool device_has_pending_threadblocks(int device_id) {
+  for (const auto &entry : threadblocks) {
+    ThreadblockStringParseInfo tb_info = parse_tb_string_id(entry.first);
+    if ((int)tb_info.device_id == device_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void write_dynamic_trace_checkpoint() {
+  if (dyn_trace.gpu_device_size() == 0) {
+    return;
+  }
+  create_folder(traces_path.c_str());
+  std::string filename = traces_path + "/dynamic_trace.pb";
+  std::ofstream ofs(filename, std::ios::binary);
+  if (!ofs) {
+    std::cerr << "Failed to open checkpoint file " << filename << std::endl;
+    return;
+  }
+  dynamic_trace::Trace checkpoint = dyn_trace;
+  checkpoint.set_nvbit_version(NVBIT_VERSION);
+  checkpoint.set_accelsim_version(TRACER_VERSION);
+  checkpoint.set_is_gathered_registers_values(static_cast<bool>(gather_registers));
+  std::string program_name = get_program_path();
+  std::size_t found = program_name.find_last_of("/");
+  if (found != std::string::npos) {
+    program_name = program_name.substr(found + 1);
+  }
+  checkpoint.set_name(program_name);
+  if (!checkpoint.SerializeToOstream(&ofs)) {
+    std::cerr << "Failed to write checkpoint " << filename << std::endl;
+  } else {
+    TRACE_LOG("Wrote trace checkpoint to %s (%d device(s))\n", filename.c_str(),
+              checkpoint.gpu_device_size());
+  }
+  ofs.close();
+}
+
+static void handle_kernel_launch_enter(CUcontext ctx, CTXstate *ctx_state,
+                                       nvbit_api_cuda_t cbid, void *params,
+                                       bool build_graph) {
+  KernelLaunchConfig cfg;
+  if (!extract_launch_config(cbid, params, cfg)) {
+    return;
+  }
+
+  int device_id;
+  cuCtxGetDevice(&device_id);
+  if (active_from_start && dynamic_kernel_limit_start &&
+      kernel_id[device_id] == dynamic_kernel_limit_start) {
+    active_region = true;
+  }
+
+  const bool before_trace_window =
+      active_from_start && dynamic_kernel_limit_start > 0 &&
+      kernel_id[device_id] < dynamic_kernel_limit_start;
+  if (before_trace_window) {
+    TRACE_LOG("NVBit skip pre-limit kernel id=%d (no nvdisasm)\n",
+              kernel_id[device_id]);
+    kernel_id[device_id]++;
+    return;
+  }
+
+  printf("terminate_after_limit_number_of_kernels_reached: %d\n", terminate_after_limit_number_of_kernels_reached);
+  printf("dynamic_kernel_limit_end: %d\n", dynamic_kernel_limit_end);
+  printf("kernel_id[device_id]: %d\n", kernel_id[device_id]);
+  // print kernel name
+  std::string kernel_name = nvbit_get_func_name(ctx, cfg.f, true);
+  printf("Kernel name: %s\n", kernel_name.c_str());
+
+  if (terminate_after_limit_number_of_kernels_reached &&
+      dynamic_kernel_limit_end != 0 &&
+      kernel_id[device_id] > dynamic_kernel_limit_end) {
+    const bool capturing = !build_graph && is_stream_capturing(cfg.hStream);
+    if (capturing) {
+      pending_terminate_after_graph[device_id] = true;
+      TRACE_LOG("NVBit: past kernel limit during graph capture; terminate after "
+                "cuGraphLaunch\n");
+      kernel_id[device_id]++;
+      return;
+    }
+    pthread_mutex_unlock(&mutex);
+    finalize_trace_outputs_and_exit();
+  }
+
+  int nregs = 0;
+  CUDA_SAFECALL(
+      cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, cfg.f));
+
+  int shmem_static_nbytes = 0;
+  CUDA_SAFECALL(cuFuncGetAttribute(
+      &shmem_static_nbytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, cfg.f));
+
+  CUDA_SAFECALL(cuFuncGetAttribute(&binary_version,
+                                   CU_FUNC_ATTRIBUTE_BINARY_VERSION, cfg.f));
+
+  get_opcode_map(OpcodeMap, binary_version);
+  instrument_function_if_needed(ctx, cfg.f, device_id);
+
+  if (active_region) {
+    nvbit_enable_instrumented(ctx, cfg.f, true);
+    stop_report[device_id] = false;
+  } else {
+    nvbit_enable_instrumented(ctx, cfg.f, false);
+    stop_report[device_id] = true;
+  }
+
+  const bool capturing = !build_graph && is_stream_capturing(cfg.hStream);
+  TRACE_LOG("NVBit enter cbid=%d kernel=%s id=%d active=%d stop=%d capture=%d build_graph=%d\n",
+            cbid, nvbit_get_func_name(ctx, cfg.f, true), kernel_id[device_id],
+            active_region ? 1 : 0, stop_report[device_id] ? 1 : 0,
+            capturing ? 1 : 0, build_graph ? 1 : 0);
+
+  char buffer[1024];
+  sprintf(buffer, std::string(traces_location + "/kernel-%d.trace").c_str(),
+          kernel_id[device_id]);
+  dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[device_id];
+
+  if (!stop_report[device_id]) {
+    int variant_id = 0;
+    auto it_map_already_instrumented =
+        map_function_to_kernel_name_and_variant_id.find(cfg.f);
+    assert(it_map_already_instrumented !=
+           map_function_to_kernel_name_and_variant_id.end());
+    variant_id = std::get<1>(it_map_already_instrumented->second);
+    std::string kernel_name(nvbit_get_func_name(ctx, cfg.f, true));
+
+    std::string final_kernel_name =
+        kernel_name + variant_delimiter_str + std::to_string(variant_id);
+
+    auto it_map_unique_function_id =
+        map_function_name_to_unique_function_id_with_variant.find(
+            final_kernel_name);
+    assert(it_map_unique_function_id !=
+           map_function_name_to_unique_function_id_with_variant.end());
+    dyn_trace.set_binary_version(binary_version);
+    uint64_t stream_key = 0;
+    current_stream_id[device_id] = stream_key;
+    dynamic_trace::cuda_stream &stream =
+        (*gpu_dev.mutable_streams())[stream_key];
+    stream.set_id(stream_key);
+    dynamic_trace::kernel *ker = stream.add_kernels();
+    ker->set_id(kernel_id[device_id]);
+    ker->set_name(final_kernel_name);
+    ker->set_function_unique_id(it_map_unique_function_id->second);
+    ker->set_size_shared_memory(shmem_static_nbytes + cfg.sharedMemBytes);
+    ker->set_number_of_registers(nregs);
+    ker->set_shared_memory_base_address(
+        (uint64_t)nvbit_get_shmem_base_addr(ctx));
+    ker->set_local_memory_base_address(
+        (uint64_t)nvbit_get_local_mem_base_addr(ctx));
+    dynamic_trace::dim3d *grid_dim = ker->mutable_grid_dim();
+    grid_dim->set_x(cfg.gridDimX);
+    grid_dim->set_y(cfg.gridDimY);
+    grid_dim->set_z(cfg.gridDimZ);
+    dynamic_trace::dim3d *block_dim = ker->mutable_block_dim();
+    block_dim->set_x(cfg.blockDimX);
+    block_dim->set_y(cfg.blockDimY);
+    block_dim->set_z(cfg.blockDimZ);
+    traced_kernels_since_graph_launch[device_id]++;
+  }
+
+  sprintf(buffer, "kernel-%d.trace", kernel_id[device_id]);
+  if (!stop_report[device_id]) {
+    uint64_t stream_key = 0;
+    dynamic_trace::cuda_stream &stream =
+        (*gpu_dev.mutable_streams())[stream_key];
+    stream.add_ordered_cuda_events(buffer);
+  }
+
+  statsFile = fopen(stats_location.c_str(), "a");
+  unsigned blocks = cfg.gridDimX * cfg.gridDimY * cfg.gridDimZ;
+  unsigned threads = cfg.blockDimX * cfg.blockDimY * cfg.blockDimZ;
+
+  fprintf(statsFile, "%d, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %d, ", device_id,
+          current_stream_id[device_id], buffer,
+          nvbit_get_func_name(ctx, cfg.f, true), cfg.gridDimX, cfg.gridDimY,
+          cfg.gridDimZ, blocks, cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ,
+          threads);
+
+  fclose(statsFile);
+
+  kernel_id[device_id]++;
+  if (!stop_report[device_id]) {
+    recv_thread_receiving[ctx] = true;
+  }
+}
+
+static void handle_kernel_launch_exit(CUcontext ctx, CTXstate *ctx_state,
+                                      const KernelLaunchConfig &cfg) {
+  int device_id;
+  cuCtxGetDevice(&device_id);
+  if (is_stream_capturing(cfg.hStream)) {
+    TRACE_LOG("NVBit exit (deferred): kernel=%s id=%d stream capturing\n",
+              nvbit_get_func_name(ctx, cfg.f, true), kernel_id[device_id] - 1);
+    return;
+  }
+
+  const unsigned completed_kernel_id = kernel_id[device_id] - 1;
+  TRACE_LOG("NVBit exit: kernel=%s id=%d\n",
+            nvbit_get_func_name(ctx, cfg.f, true), completed_kernel_id);
+  pthread_mutex_unlock(&mutex);
+  finalize_kernel_launch_after_exec(ctx, ctx_state, device_id, completed_kernel_id,
+                                    0, false);
+  pthread_mutex_lock(&mutex);
+
+  if (active_from_start && dynamic_kernel_limit_end &&
+      kernel_id[device_id] > dynamic_kernel_limit_end) {
+    active_region = false;
+  }
+}
+
+static void serialize_threadblocks_for_device(int device_id, int kernel_id_filter) {
+  create_folder(threadblock_trace_path.c_str());
+  create_folder(threadblock_register_values_path.c_str());
+  auto it_tb = threadblocks.begin();
+  while (it_tb != threadblocks.end()) {
+    std::string tb_string_id = it_tb->first;
+    ThreadblockStringParseInfo tb_info = parse_tb_string_id(tb_string_id);
+    const bool kernel_matches =
+        kernel_id_filter < 0 || tb_info.kernel_id == (unsigned)kernel_id_filter;
+    if ((tb_info.device_id == device_id) &&
+        (tb_info.stream_id == current_stream_id[device_id]) && kernel_matches) {
+      std::string device_folder =
+          threadblock_trace_path + "/device_" + std::to_string(tb_info.device_id);
+      std::string stream_folder =
+          device_folder + "/stream_" + std::to_string(tb_info.stream_id);
+      std::string kernel_folder =
+          stream_folder + "/kernel_" + std::to_string(tb_info.kernel_id);
+
+      create_folder(device_folder.c_str());
+      create_folder(stream_folder.c_str());
+      create_folder(kernel_folder.c_str());
+
+      dynamic_trace::threadblock &tb = it_tb->second;
+      std::string tb_file = kernel_folder + "/" + tb_string_id + ".pb";
+      std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
+      if (!tb.SerializeToOstream(&ofs_tb)) {
+        std::cerr << "Failed to write threadblock content." << std::endl;
+        fflush(stdout);
+        abort();
+      } else {
+        tb.Clear();
+      }
+      ofs_tb.close();
+      it_tb = threadblocks.erase(it_tb);
+    } else {
+      it_tb++;
+    }
+  }
+}
+
+/* After a kernel or CUDA graph finishes executing: sync, flush NVBit channel,
+ * wait for recv thread, append stats, and write per-CTA protobuf files.
+ * Ported from accel-sim-framework tracer #427 (classic text tracer). */
+static void finalize_kernel_launch_after_exec(CUcontext ctx, CTXstate *ctx_state,
+                                              int device_id,
+                                              unsigned completed_kernel_id,
+                                              cudaStream_t cuda_stream,
+                                              bool serialize_all_pending_tbs) {
+  if (cuda_stream) {
+    CUDA_SAFECALL(cudaStreamSynchronize(cuda_stream));
+  } else {
+    cudaDeviceSynchronize();
+  }
+  cudaError_t cuErr = cudaGetLastError();
+  if (cuErr != cudaSuccess) {
+    fprintf(stdout, "CUDA error in file '%s' in line %i : %s.\n", __FILE__,
+            __LINE__, cudaGetErrorString(cuErr));
+    fflush(stdout);
+    abort();
+  }
+
+  skip_callback_flag = true;
+  if (cuda_stream) {
+    flush_channel<<<1, 1, 0, cuda_stream>>>(ctx_state->channel_dev);
+    CUDA_SAFECALL(cudaStreamSynchronize(cuda_stream));
+  } else {
+    flush_channel<<<1, 1>>>(ctx_state->channel_dev);
+    cudaDeviceSynchronize();
+  }
+  skip_callback_flag = false;
+  assert(cudaGetLastError() == cudaSuccess);
+
+  while (recv_thread_receiving[ctx]) {
+    pthread_yield();
+  }
+
+  unsigned total_insts_per_kernel =
+      total_dynamic_instr_counter - old_total_insts;
+  old_total_insts = total_dynamic_instr_counter;
+
+  unsigned reported_insts_per_kernel =
+      reported_dynamic_instr_counter - old_total_reported_insts;
+  old_total_reported_insts = reported_dynamic_instr_counter;
+
+  statsFile = fopen(stats_location.c_str(), "a");
+  fprintf(statsFile, "%d,%d", total_insts_per_kernel, reported_insts_per_kernel);
+  fprintf(statsFile, "\n");
+  fclose(statsFile);
+
+  if (!stop_report[device_id]) {
+    if (serialize_all_pending_tbs) {
+      serialize_threadblocks_for_device(device_id, -1);
+    } else {
+      serialize_threadblocks_for_device(device_id, completed_kernel_id);
+    }
+  }
+  recv_thread_receiving[ctx] = false;
+}
+
+/* Classic accel-sim #427: after cudaGraphLaunch, sync stream and flush NVBit channel.
+ * Must be called with pthread mutex released (CUDA callbacks may re-enter NVBit). */
+static void finalize_cuda_graph_launch(CUcontext ctx, CTXstate *ctx_state,
+                                       cudaStream_t cuda_stream) {
+  if (cuda_stream) {
+    cudaStreamSynchronize(cuda_stream);
+  } else {
+    cudaDeviceSynchronize();
+  }
+  assert(cudaGetLastError() == cudaSuccess);
+
+  skip_callback_flag = true;
+  if (cuda_stream) {
+    flush_channel<<<1, 1, 0, cuda_stream>>>(ctx_state->channel_dev);
+    cudaStreamSynchronize(cuda_stream);
+  } else {
+    flush_channel<<<1, 1>>>(ctx_state->channel_dev);
+    cudaDeviceSynchronize();
+  }
+  skip_callback_flag = false;
+  assert(cudaGetLastError() == cudaSuccess);
+
+  while (recv_thread_receiving[ctx]) {
+    pthread_yield();
+  }
+  recv_thread_receiving[ctx] = false;
+}
+
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char *name, void *params, CUresult *pStatus) {
   // std::cout << "nvbit_at_cuda_event: "  << cbid << std::endl; fflush(stdout);
@@ -995,13 +1511,25 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     first_call = false;
     
     create_folder(traces_path.c_str());
-
-    if (active_from_start && !dynamic_kernel_limit_start || dynamic_kernel_limit_start == 1)
-      active_region = true;
-    else {
-      if (active_from_start)
-        active_region = false;
+    ensure_traces_output_abs();
+    {
+      char *wd_now = getcwd(NULL, 0);
+      printf("NVBit traces directory: %s\n", traces_output_abs.c_str());
+      printf("NVBit cwd now: %s (cwd at tool init: %s)\n", wd_now, cwd.c_str());
+      free(wd_now);
     }
+
+    if (active_from_start) {
+      if (dynamic_kernel_limit_start == 0 || dynamic_kernel_limit_start == 1) {
+        active_region = true;
+      } else {
+        active_region = false;
+      }
+    }
+
+    printf("NVBit enhanced tracer: output=%s/ limit_start=%d limit_end=%d active_region=%d\n",
+           traces_path.c_str(), dynamic_kernel_limit_start, dynamic_kernel_limit_end,
+           active_region ? 1 : 0);
     
     if(user_defined_folders == 1)
     {
@@ -1038,192 +1566,63 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
     }
 
   } else if (cbid == API_CUDA_cuLaunchKernel_ptsz ||
-             cbid == API_CUDA_cuLaunchKernel) {
-    cuLaunchKernel_params *p = (cuLaunchKernel_params *)params;
-
+             cbid == API_CUDA_cuLaunchKernel ||
+             cbid == API_CUDA_cuLaunchKernelEx ||
+             cbid == API_CUDA_cuLaunchKernelEx_ptsz ||
+             cbid == API_CUDA_cuLaunchCooperativeKernel ||
+             cbid == API_CUDA_cuLaunchCooperativeKernel_ptsz ||
+             cbid == API_CUDA_cuLaunchGridAsync) {
+    KernelLaunchConfig cfg;
+    if (!extract_launch_config(cbid, params, cfg)) {
+      pthread_mutex_unlock(&mutex);
+      return;
+    }
     if (!is_exit) {
-      int device_id;
-      cuCtxGetDevice(&device_id);
-      if (active_from_start && dynamic_kernel_limit_start && kernel_id[device_id] == dynamic_kernel_limit_start)
-        active_region = true;
-
-      if (terminate_after_limit_number_of_kernels_reached && dynamic_kernel_limit_end != 0 && kernel_id[device_id] > dynamic_kernel_limit_end)
-      {
-        pthread_mutex_unlock(&mutex);
-        exit(0);
-      }
-      
-      int nregs = 0;
-      CUDA_SAFECALL(
-          cuFuncGetAttribute(&nregs, CU_FUNC_ATTRIBUTE_NUM_REGS, p->f));
-
-      int shmem_static_nbytes = 0;
-      CUDA_SAFECALL(cuFuncGetAttribute(
-          &shmem_static_nbytes, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, p->f));
-
-      CUDA_SAFECALL(cuFuncGetAttribute(&binary_version,
-                                       CU_FUNC_ATTRIBUTE_BINARY_VERSION, p->f));
-
-      get_opcode_map(OpcodeMap, binary_version);
-      instrument_function_if_needed(ctx, p->f, device_id);
-
-      if (active_region) {
-        nvbit_enable_instrumented(ctx, p->f, true);
-        stop_report[device_id] = false;
-      } else {
-        nvbit_enable_instrumented(ctx, p->f, false);
-        stop_report[device_id] = true;
-      }
-
-      char buffer[1024];
-      sprintf(buffer, std::string(traces_location+"/kernel-%d.trace").c_str(), kernel_id[device_id]);
-      dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[device_id];
-
-      if (!stop_report[device_id]) {
-        int variant_id = 0;
-        auto it_map_already_instrumented = map_function_to_kernel_name_and_variant_id.find(p->f);
-        assert(it_map_already_instrumented != map_function_to_kernel_name_and_variant_id.end());
-        variant_id = std::get<1>(it_map_already_instrumented->second);
-        std::string kernel_name(nvbit_get_func_name(ctx, p->f, true));
-
-        // std::vector<int> kernel_argument_sizes = nvbit_get_kernel_argument_sizes(p->f);
-        
-        std::string final_kernel_name = kernel_name + variant_delimiter_str + std::to_string(variant_id);
-        
-        auto it_map_unique_function_id = map_function_name_to_unique_function_id_with_variant.find(final_kernel_name);
-        assert(it_map_unique_function_id != map_function_name_to_unique_function_id_with_variant.end());
-        dyn_trace.set_binary_version(binary_version);
-        auto stream_map = gpu_dev.streams();
-        uint64_t stream_key = (uint64_t)p->hStream;
-        stream_key = 0; // We use 0 as stream key for now, as we do not support multiple streams yet. WIPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
-        current_stream_id[device_id] = stream_key;
-        dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
-        stream.set_id(stream_key);
-        dynamic_trace::kernel *ker = stream.add_kernels();
-        ker->set_id(kernel_id[device_id]);
-        ker->set_name(final_kernel_name);
-        ker->set_function_unique_id(it_map_unique_function_id->second);
-        ker->set_size_shared_memory(shmem_static_nbytes + p->sharedMemBytes);
-        ker->set_number_of_registers(nregs);
-        ker->set_shared_memory_base_address((uint64_t)nvbit_get_shmem_base_addr(ctx));
-        ker->set_local_memory_base_address((uint64_t)nvbit_get_local_mem_base_addr(ctx));
-        dynamic_trace::dim3d *grid_dim = ker->mutable_grid_dim();
-        grid_dim->set_x(p->gridDimX);
-        grid_dim->set_y(p->gridDimY);
-        grid_dim->set_z(p->gridDimZ);
-        dynamic_trace::dim3d *block_dim = ker->mutable_block_dim();
-        block_dim->set_x(p->blockDimX);
-        block_dim->set_y(p->blockDimY);
-        block_dim->set_z(p->blockDimZ);
-      }
-
-      // This will be a relative path to the traces file
-      sprintf(buffer,"kernel-%d.trace", kernel_id[device_id]);
-      if (!stop_report[device_id]) {
-        uint64_t stream_key = (uint64_t)p->hStream;
-        stream_key = 0; // We use 0 as stream key for now, as we do not support multiple streams yet. WIPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
-        dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[stream_key];
-        stream.add_ordered_cuda_events(buffer);
-      }
-
-      statsFile = fopen(stats_location.c_str(), "a");
-      unsigned blocks = p->gridDimX * p->gridDimY * p->gridDimZ;
-      unsigned threads = p->blockDimX * p->blockDimY * p->blockDimZ;
-
-      fprintf(statsFile, "%d, %d, %s, %s, %d, %d, %d, %d, %d, %d, %d, %d, ", device_id , current_stream_id[device_id], buffer,
-              nvbit_get_func_name(ctx, p->f, true), p->gridDimX, p->gridDimY,
-              p->gridDimZ, blocks, p->blockDimX, p->blockDimY, p->blockDimZ,
-              threads);
-
-      fclose(statsFile);
-
-      kernel_id[device_id]++;
-      recv_thread_receiving[ctx] = true;
-
+      handle_kernel_launch_enter(ctx, ctx_state, cbid, params, false);
     } else {
+      handle_kernel_launch_exit(ctx, ctx_state, cfg);
+    }
+  } else if (cbid == API_CUDA_cuGraphAddKernelNode) {
+    if (!is_exit) {
+      handle_kernel_launch_enter(ctx, ctx_state, cbid, params, true);
+    }
+  } else if (cbid == API_CUDA_cuGraphLaunch) {
+    if (is_exit) {
+      cuGraphLaunch_params *p = (cuGraphLaunch_params *)params;
       int device_id;
       cuCtxGetDevice(&device_id);
-      /* make sure current kernel is completed */
-      cudaDeviceSynchronize();
-      // GET CUDA ERROR:
-      cudaError_t cuErr = cudaGetLastError();
-      if (cuErr != cudaSuccess) {
-        fprintf(stdout, "CUDA error in file '%s' in line %i : %s.\n", __FILE__,
-                __LINE__, cudaGetErrorString(cuErr));
-        fflush(stdout);
-        abort();
+      const bool had_traced_kernels =
+          traced_kernels_since_graph_launch[device_id] > 0;
+      const bool had_threadblocks = device_has_pending_threadblocks(device_id);
+      cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(p->hStream);
+
+      TRACE_LOG("NVBit cuGraphLaunch exit: traced_kernels=%d pending_tbs=%d\n",
+                had_traced_kernels ? 1 : 0, had_threadblocks ? 1 : 0);
+
+      pthread_mutex_unlock(&mutex);
+      finalize_cuda_graph_launch(ctx, ctx_state, cuda_stream);
+      pthread_mutex_lock(&mutex);
+
+      if (had_traced_kernels || had_threadblocks) {
+        unsigned total_insts_per_kernel =
+            total_dynamic_instr_counter - old_total_insts;
+        old_total_insts = total_dynamic_instr_counter;
+        unsigned reported_insts_per_kernel =
+            reported_dynamic_instr_counter - old_total_reported_insts;
+        old_total_reported_insts = reported_dynamic_instr_counter;
+        statsFile = fopen(stats_location.c_str(), "a");
+        fprintf(statsFile, "%d,%d\n", total_insts_per_kernel,
+                reported_insts_per_kernel);
+        fclose(statsFile);
+        serialize_threadblocks_for_device(device_id, -1);
+        write_dynamic_trace_checkpoint();
+        traced_kernels_since_graph_launch[device_id] = 0;
       }
-      assert(cuErr == cudaSuccess);
-
-      /* make sure we prevent re-entry on the nvbit_callback when issuing
-       * the flush_channel kernel */
-      skip_callback_flag = true;
-
-      /* issue flush of channel so we are sure all the memory accesses
-       * have been pushed */
-      flush_channel<<<1, 1>>>(ctx_state->channel_dev);
-      cudaDeviceSynchronize();
-      assert(cudaGetLastError() == cudaSuccess);
-
-      /* unset the skip flag */
-      skip_callback_flag = false;
-
-      /* wait here until the receiving thread has not finished with the
-       * current kernel */
-      while (recv_thread_receiving[ctx]) {
-        pthread_yield();
+      if (pending_terminate_after_graph[device_id]) {
+        TRACE_LOG("NVBit: terminating after cudaGraphLaunch (TERMINATE_UPON_LIMIT)\n");
+        pthread_mutex_unlock(&mutex);
+        finalize_trace_outputs_and_exit();
       }
-
-      unsigned total_insts_per_kernel =
-          total_dynamic_instr_counter - old_total_insts;
-      old_total_insts = total_dynamic_instr_counter;
-
-      unsigned reported_insts_per_kernel =
-          reported_dynamic_instr_counter - old_total_reported_insts;
-      old_total_reported_insts = reported_dynamic_instr_counter;
-
-      statsFile = fopen(stats_location.c_str(), "a");
-      fprintf(statsFile, "%d,%d", total_insts_per_kernel,
-              reported_insts_per_kernel);
-      fprintf(statsFile, "\n");
-      fclose(statsFile);
-      
-      if (!stop_report[device_id]) {
-        create_folder(threadblock_trace_path.c_str());
-        create_folder(threadblock_register_values_path.c_str());
-        auto it_tb = threadblocks.begin();
-        while(it_tb != threadblocks.end()) {
-          std::string tb_string_id = it_tb->first;
-          ThreadblockStringParseInfo tb_info = parse_tb_string_id(tb_string_id);
-          if((tb_info.device_id == device_id) && (tb_info.stream_id == current_stream_id[device_id]) && (tb_info.kernel_id == (kernel_id[device_id]-1))) {
-            // Create hierarchical folder structure
-            std::string device_folder = threadblock_trace_path + "/device_" + std::to_string(tb_info.device_id);
-            std::string stream_folder = device_folder + "/stream_" + std::to_string(tb_info.stream_id);
-            std::string kernel_folder = stream_folder + "/kernel_" + std::to_string(tb_info.kernel_id);
-            
-            create_folder(device_folder.c_str());
-            create_folder(stream_folder.c_str());
-            create_folder(kernel_folder.c_str());
-            
-            dynamic_trace::threadblock &tb = it_tb->second;
-            std::string tb_file = kernel_folder + "/" + tb_string_id + ".pb";
-            std::ofstream ofs_tb(tb_file, std::ios::out | std::ios::binary);
-            if (!tb.SerializeToOstream(&ofs_tb)) {
-              std::cerr << "Failed to write threadblock content." << std::endl;
-              fflush(stdout);
-              abort();
-            }else {
-              tb.Clear();
-            }
-            ofs_tb.close();
-            it_tb = threadblocks.erase(it_tb);
-          }else {
-            it_tb++;
-          }
-        }
-      }
-      if (active_from_start && dynamic_kernel_limit_end && kernel_id[device_id] > dynamic_kernel_limit_end)
-        active_region = false;
     }
   } else if (cbid == API_CUDA_cuProfilerStart && is_exit) {
       if (!active_from_start) {
@@ -1351,7 +1750,6 @@ void *recv_thread_fun(void *args) {
     if (num_recv_bytes > 0) {
       uint32_t num_processed_bytes = 0;
       dynamic_trace::cuda_stream &stream = (*gpu_dev.mutable_streams())[current_stream_id[device_id]];
-      dynamic_trace::kernel &ker = (*stream.mutable_kernels())[kernel_id[device_id]-2]; 
       while (num_processed_bytes < num_recv_bytes) {
         inst_trace_t *ma = (inst_trace_t *)&recv_buffer[num_processed_bytes];
 
@@ -1362,6 +1760,12 @@ void *recv_thread_fun(void *args) {
         if (ma->cta_id_x == -1) {
           recv_thread_receiving[ctx] = false;
           break;
+        }
+        // Kernels skipped by DYNAMIC_KERNEL_LIMIT_START are not in mutable_kernels().
+        // Do not index by global kernel_id (breaks when start > 1).
+        if (stream.kernels_size() == 0) {
+          num_processed_bytes += sizeof(inst_trace_t);
+          continue;
         }
         while(!recv_thread_receiving[ctx]) {
           pthread_yield();
@@ -1471,58 +1875,270 @@ int check_system_call(int system_res, const char* syscall) {
   return system_res;
 }
 
-void enhanced_tracer() {
-  create_folder(extrainfo_path.c_str());
-  create_folder(cubin_path.c_str());
-  create_folder(sass_path.c_str());
-  create_folder(register_usage_path.c_str());
-  std::string program_path = get_program_path();
-  std::size_t found = program_path.find_last_of("/");
-  std::string program_name = program_path.substr(found + 1);
-  std::string command_get_cubin = "cd " + cubin_path + " && cuobjdump " + program_path + " -xelf all -arch=sm_" + std::to_string(binary_version);
-  std::cout << "Generating extra information for the enhanced traces of benchmark: " << program_name << std::endl;
-  check_system_call(system(command_get_cubin.c_str()), command_get_cubin.c_str());
-  m_enhanced_traced_execution = new traced_execution(program_name);
-  std::string absolute_cubin_path = cwd + "/" + cubin_path;
-  for (const auto &entry : std::filesystem::directory_iterator(absolute_cubin_path))
-  {
-    std::string aux_cubin = entry.path().filename().string();
-    std::string base_name = entry.path().stem().string();
-    std::string command_get_register_usage = "cd " + register_usage_path + " && nvdisasm -lrm count ../cubin/" + aux_cubin + " > " + base_name + ".rfu";
-    std::string command_get_sass = "cd " + sass_path + " && cuobjdump -sass ../cubin/" + aux_cubin + " > " + base_name + ".sass";
-    std::cout << "Parsing cubin: " << aux_cubin << std::endl;
-    int call_code_rfu = check_system_call(system(command_get_register_usage.c_str()), command_get_register_usage.c_str());
-    int call_code_sass = check_system_call(system(command_get_sass.c_str()), command_get_sass.c_str());
-    if(call_code_sass == 0) {
-      parse_sass(binary_version, entry);
-    }
-    if(call_code_rfu == 0) {
-      parse_rfu(entry);
+static bool cubin_directory_has_files(const std::string &abs_cubin_path) {
+  if (!std::filesystem::exists(abs_cubin_path)) {
+    return false;
+  }
+  for (const auto &entry : std::filesystem::directory_iterator(abs_cubin_path)) {
+    if (entry.is_regular_file()) {
+      return true;
     }
   }
-  for(auto kernel_name : all_kernels_key_instructions_by_pc) {
-    for(auto variant : kernel_name.second) {
-      if(!variant.sass_has_been_parsed || !variant.rfu_has_been_parsed) {
-        std::cout << "Error. Kernel " << kernel_name.first << " variant " << variant.variant_id << " has not been parsed." << std::endl;
-        std::cout << "SASS parsed: " << variant.sass_has_been_parsed << std::endl;
-        std::cout << "RFU parsed: " << variant.rfu_has_been_parsed << std::endl;
-        std::cout << "Traced instructions: " << std::endl;
-        print_map(variant.key_instructions_by_pc);
-        auto it_already_captured_instr = map_func_addr_to_pc_to_sass_instr.find(variant.func_addr);
-        assert(it_already_captured_instr != map_func_addr_to_pc_to_sass_instr.end());
-        std::string kernel_name_to_add = variant.original_kernel_name + variant_delimiter_str + std::to_string(variant.variant_id);
-        m_enhanced_traced_execution->add_no_binary_kernel(kernel_name_to_add, variant.unique_function_id, variant.func_addr, binary_version, it_already_captured_instr->second, false);
+  return false;
+}
+
+static std::vector<std::string> collect_cubin_binary_candidates(
+    const std::string &program_path) {
+  std::vector<std::string> candidates;
+  auto add_unique = [&](const std::string &path) {
+    if (path.empty()) {
+      return;
+    }
+    if (std::find(candidates.begin(), candidates.end(), path) ==
+        candidates.end()) {
+      candidates.push_back(path);
+    }
+  };
+
+  if (const char *env_binary = getenv("TRACER_CUDA_BINARY")) {
+    add_unique(env_binary);
+  }
+
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  while (std::getline(maps, line)) {
+    const size_t path_start = line.find('/');
+    if (path_start == std::string::npos) {
+      continue;
+    }
+    std::string path = line.substr(path_start);
+    const size_t space = path.find(' ');
+    if (space != std::string::npos) {
+      path = path.substr(0, space);
+    }
+    if (path.find(".so") == std::string::npos) {
+      continue;
+    }
+    if (path.find("ggml-cuda") != std::string::npos ||
+        path.find("libggml") != std::string::npos ||
+        path.find("cublas") != std::string::npos ||
+        path.find("cudnn") != std::string::npos) {
+      add_unique(path);
+    }
+  }
+
+  add_unique(program_path);
+  return candidates;
+}
+
+static bool try_extract_cubins(const std::string &binary_path, int sm_arch) {
+  const std::string abs_cubin = trace_abs_path("extra_info/cubin");
+  std::filesystem::remove_all(abs_cubin);
+  create_folder(abs_cubin.c_str());
+
+  if (!std::filesystem::exists(binary_path)) {
+    ENHANCED_LOG("binary not found: %s\n", binary_path.c_str());
+    return false;
+  }
+  ENHANCED_LOG("binary exists: %s (%lld bytes)\n", binary_path.c_str(),
+               (long long)std::filesystem::file_size(binary_path));
+
+  const std::string command = "cd '" + abs_cubin + "' && cuobjdump '" +
+                              binary_path + "' -xelf all -arch=sm_" +
+                              std::to_string(sm_arch);
+  ENHANCED_LOG("running: %s\n", command.c_str());
+  const int ret = system(command.c_str());
+  ENHANCED_LOG("cuobjdump exit status: %d (0x%x)\n", ret, ret);
+  log_directory_contents("cubin after cuobjdump", abs_cubin);
+
+  if (ret != 0 || !cubin_directory_has_files(abs_cubin)) {
+    ENHANCED_LOG("no cubin files extracted from %s\n", binary_path.c_str());
+    return false;
+  }
+  ENHANCED_LOG("cubin extraction OK for %s\n", binary_path.c_str());
+  return true;
+}
+
+static void add_kernel_from_runtime_captured_sass(
+    const std::string &kernel_name, traced_kernel_id &variant, int *added,
+    int *skipped) {
+  auto it_instr = map_func_addr_to_pc_to_sass_instr.find(variant.func_addr);
+  if (it_instr == map_func_addr_to_pc_to_sass_instr.end()) {
+    ENHANCED_LOG("WARN: no NVBit SASS for kernel %s variant %u (func_addr=0x%lx)\n",
+                 kernel_name.c_str(), variant.variant_id,
+                 (unsigned long)variant.func_addr);
+    if (skipped) {
+      (*skipped)++;
+    }
+    return;
+  }
+  const std::string final_kernel_name =
+      variant.original_kernel_name + variant_delimiter_str +
+      std::to_string(variant.variant_id);
+  ENHANCED_LOG("add runtime kernel %s unique_id=%u sass_instrs=%zu\n",
+               final_kernel_name.c_str(), variant.unique_function_id,
+               it_instr->second.size());
+  m_enhanced_traced_execution->add_no_binary_kernel(
+      final_kernel_name, variant.unique_function_id, variant.func_addr,
+      binary_version > 0 ? binary_version : 90, it_instr->second, false);
+  variant.sass_has_been_parsed = true;
+  if (added) {
+    (*added)++;
+  }
+}
+
+static void build_enhanced_trace_from_runtime_captured_sass() {
+  ENHANCED_LOG(
+      "using NVBit-captured SASS (no cubin from cuobjdump; typical for "
+      "dlopen CUDA libs like llama.cpp)\n");
+  ENHANCED_LOG("instrumented kernel names in memory: %zu\n",
+               all_kernels_key_instructions_by_pc.size());
+  ENHANCED_LOG("runtime SASS tables (func_addr): %zu\n",
+               map_func_addr_to_pc_to_sass_instr.size());
+  int added = 0;
+  int skipped = 0;
+  for (auto &kernel_entry : all_kernels_key_instructions_by_pc) {
+    ENHANCED_LOG("kernel group '%s' variants=%zu\n", kernel_entry.first.c_str(),
+                 kernel_entry.second.size());
+    for (auto &variant : kernel_entry.second) {
+      add_kernel_from_runtime_captured_sass(kernel_entry.first, variant, &added,
+                                          &skipped);
+    }
+  }
+  ENHANCED_LOG("runtime SASS summary: added=%d skipped=%d\n", added, skipped);
+}
+
+void enhanced_tracer() {
+  ensure_traces_output_abs();
+  const std::string abs_extra = trace_abs_path("extra_info");
+  const std::string abs_cubin = trace_abs_path("extra_info/cubin");
+  const std::string abs_sass = trace_abs_path("extra_info/sass");
+  const std::string abs_rfu = trace_abs_path("extra_info/register_usage");
+  const std::string abs_json = trace_abs_path("extra_info/enhanced_execution_info.json");
+
+  create_folder(abs_extra.c_str());
+  create_folder(abs_cubin.c_str());
+  create_folder(abs_sass.c_str());
+  create_folder(abs_rfu.c_str());
+
+  char *wd_now = getcwd(NULL, 0);
+  ENHANCED_LOG("=== enhanced_tracer start ===\n");
+  ENHANCED_LOG("cwd now: %s | cwd at init: %s\n", wd_now, cwd.c_str());
+  free(wd_now);
+  ENHANCED_LOG("traces_output_abs: %s\n", traces_output_abs.c_str());
+  ENHANCED_LOG("json target: %s\n", abs_json.c_str());
+
+  std::string program_path = get_program_path();
+  std::size_t found = program_path.find_last_of("/");
+  std::string program_name =
+      found != std::string::npos ? program_path.substr(found + 1) : program_path;
+  const int sm_arch = binary_version > 0 ? binary_version : 90;
+  ENHANCED_LOG("host binary (backtrace): %s\n", program_path.c_str());
+  ENHANCED_LOG("binary_version=%d sm_arch=%d already_instrumented=%zu\n",
+               binary_version, sm_arch, already_instrumented.size());
+
+  const std::vector<std::string> candidates =
+      collect_cubin_binary_candidates(program_path);
+  ENHANCED_LOG("cuobjdump candidates (%zu):\n", candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const bool exists = std::filesystem::exists(candidates[i]);
+    ENHANCED_LOG("  [%zu] %s %s\n", i, candidates[i].c_str(),
+                 exists ? "" : "(MISSING)");
+  }
+
+  bool cubin_ok = false;
+  std::string cubin_source;
+  if (tracer_skip_cubin_dump) {
+    ENHANCED_LOG("TRACER_SKIP_CUBIN_DUMP=1: skipping cuobjdump on libggml-cuda.so "
+                 "(use NVBit SASS for traced kernels only)\n");
+  } else {
+    for (const std::string &candidate : candidates) {
+      if (try_extract_cubins(candidate, sm_arch)) {
+        cubin_ok = true;
+        cubin_source = candidate;
+        break;
       }
     }
   }
-  std::cout << "Enhanced tracer has parsed " << all_kernels_key_instructions_by_pc.size() << "/" << already_instrumented.size() << " kernels" << std::endl;
-  if(!intermediate_extra_files_persistance) {
-    remove_folder(cubin_path.c_str());
-    remove_folder(sass_path.c_str());
-    remove_folder(register_usage_path.c_str());
+
+  m_enhanced_traced_execution = new traced_execution(program_name);
+
+  if (cubin_ok) {
+    ENHANCED_LOG("cubin path selected: %s\n", cubin_source.c_str());
+    log_directory_contents("cubin input", abs_cubin);
+    for (const auto &entry : std::filesystem::directory_iterator(abs_cubin)) {
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+      std::string aux_cubin = entry.path().filename().string();
+      std::string base_name = entry.path().stem().string();
+      const std::string abs_cubin_file = abs_cubin + "/" + aux_cubin;
+      const std::string abs_sass_file = abs_sass + "/" + base_name + ".sass";
+      const std::string abs_rfu_file = abs_rfu + "/" + base_name + ".rfu";
+      const std::string command_get_register_usage =
+          "nvdisasm -lrm count '" + abs_cubin_file + "' > '" + abs_rfu_file +
+          "'";
+      const std::string command_get_sass =
+          "cuobjdump -sass '" + abs_cubin_file + "' > '" + abs_sass_file + "'";
+      ENHANCED_LOG("parsing cubin %s\n", aux_cubin.c_str());
+      ENHANCED_LOG("  sass cmd: %s\n", command_get_sass.c_str());
+      ENHANCED_LOG("  rfu  cmd: %s\n", command_get_register_usage.c_str());
+
+      printf("saving register usage and sass to %s and %s\n", abs_rfu_file.c_str(), abs_sass_file.c_str());
+      int call_code_rfu =
+          check_system_call(system(command_get_register_usage.c_str()),
+                            command_get_register_usage.c_str());
+      int call_code_sass = check_system_call(system(command_get_sass.c_str()),
+                                             command_get_sass.c_str());
+      log_directory_contents("sass after cubin parse", abs_sass);
+      log_directory_contents("register_usage after cubin parse", abs_rfu);
+      if (call_code_sass == 0) {
+        parse_sass(binary_version, entry);
+      }
+      if (call_code_rfu == 0) {
+        parse_rfu(entry);
+      }
+    }
+    for (auto &kernel_name : all_kernels_key_instructions_by_pc) {
+      for (auto &variant : kernel_name.second) {
+        if (!variant.sass_has_been_parsed || !variant.rfu_has_been_parsed) {
+          ENHANCED_LOG(
+              "kernel %s variant %u not fully parsed from cubin; NVBit fallback\n",
+              kernel_name.first.c_str(), variant.variant_id);
+          int added = 0, skipped = 0;
+          add_kernel_from_runtime_captured_sass(kernel_name.first, variant,
+                                                &added, &skipped);
+        }
+      }
+    }
+  } else {
+    ENHANCED_LOG("all cuobjdump attempts failed; switching to runtime SASS path\n");
+    build_enhanced_trace_from_runtime_captured_sass();
+  }
+
+  ENHANCED_LOG("kernel groups in memory: %zu / instrumented functions: %zu\n",
+               all_kernels_key_instructions_by_pc.size(),
+               already_instrumented.size());
+  if (!intermediate_extra_files_persistance) {
+    ENHANCED_LOG("removing intermediate dirs (INTERMEDIATE_EXTRA_FILES_PERSISTANCE=0)\n");
+    std::filesystem::remove_all(abs_cubin);
+    std::filesystem::remove_all(abs_sass);
+    std::filesystem::remove_all(abs_rfu);
+  } else {
+    ENHANCED_LOG("keeping intermediate dirs (INTERMEDIATE_EXTRA_FILES_PERSISTANCE=1)\n");
+    log_directory_contents("cubin final", abs_cubin);
+    log_directory_contents("sass final", abs_sass);
+    log_directory_contents("register_usage final", abs_rfu);
   }
   m_enhanced_traced_execution->remove_useless_kernels();
-  m_enhanced_traced_execution->SerializeToFile(extrainfo_path +"/enhanced_execution_info.json");
+  const bool wrote = m_enhanced_traced_execution->SerializeToFile(abs_json);
+  if (!wrote) {
+    ENHANCED_LOG("ERROR: failed to write %s\n", abs_json.c_str());
+  } else {
+  ENHANCED_LOG("wrote %s (%lld bytes)\n", abs_json.c_str(),
+               (long long)std::filesystem::file_size(abs_json));
+  }
+  ENHANCED_LOG("=== enhanced_tracer done ===\n");
 }
 
 void nvbit_at_ctx_init(CUcontext ctx) {
@@ -1546,6 +2162,8 @@ void init_context_state(CUcontext ctx) {
       stop_report[i] = false;
       kernel_id.push_back(1);
       current_stream_id.push_back(0);
+      traced_kernels_since_graph_launch.push_back(0);
+      pending_terminate_after_graph.push_back(false);
     }
   }
   CTXstate* ctx_state = ctx_state_map[ctx];
@@ -1573,6 +2191,10 @@ void nvbit_at_ctx_term(CUcontext ctx) {
   assert(ctx_state_map.find(ctx) != ctx_state_map.end());
   CTXstate* ctx_state = ctx_state_map[ctx];
   pending_devices_to_finish--;
+  fprintf(stderr,
+          "Tracer: nvbit_at_ctx_term ctx=%p pending_devices_to_finish=%u\n",
+          (void *)ctx, pending_devices_to_finish);
+  fflush(stderr);
   if(pending_devices_to_finish == 0) {
     dyn_trace.set_nvbit_version(NVBIT_VERSION);
     dyn_trace.set_accelsim_version(TRACER_VERSION);
@@ -1597,8 +2219,16 @@ void nvbit_at_ctx_term(CUcontext ctx) {
       ofs.close();
   }
     std::cout << "Starting the enhanced tracer" << std::endl;
+    fprintf(stderr, "Tracer: nvbit_at_ctx_term -> enhanced_tracer()\n");
+    fflush(stderr);
     enhanced_tracer();
     std::cout << "Terminated the enhanced tracer" << std::endl;
+  } else {
+    fprintf(stderr,
+            "Tracer: deferring enhanced_tracer until all CUDA contexts end "
+            "(pending=%u)\n",
+            pending_devices_to_finish);
+    fflush(stderr);
   }
   ctx_state->recv_thread_done = RecvThreadState::STOP;
   while (ctx_state->recv_thread_done != RecvThreadState::FINISHED);

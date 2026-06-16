@@ -12,13 +12,15 @@ endif
 # MOD. Begin. ENHANCED TRACES
 TRACES_ENHANCED_DIR=../../../traces_enhanced/
 TRACES_ENHANCED_OBJ=$(wildcard $(TRACES_ENHANCED_DIR)/obj/*.o)
+include ../../../protobuf_deps.mk
+PROTOBUF_CXXFLAGS := $(PROTOBUF_INCLUDES)
 # MOD. End. ENHANCED TRACES
 
 $(TARGET): post-traces-processing.cpp
-	g++ -std=c++11 $(OPTFLAGS) $(TRACES_ENHANCED_OBJ) -o $@ $^
+	g++ -std=c++11 $(OPTFLAGS) $(PROTOBUF_CXXFLAGS) $(TRACES_ENHANCED_OBJ) -o $@ $^ $(PROTOBUF_LIBS)
 
 $(COMPRESSED): post-traces-processing-compressed.cpp
-	g++ -std=c++17 -Wall -Werror $(OPTFLAGS) $(TRACES_ENHANCED_OBJ) -o $@ $^ -lz
+	g++ -std=c++17 -Wall -Werror $(OPTFLAGS) $(PROTOBUF_CXXFLAGS) $(TRACES_ENHANCED_OBJ) -o $@ $^ -lz $(PROTOBUF_LIBS)
 
 all: $(TARGET) $(COMPRESSED)
 

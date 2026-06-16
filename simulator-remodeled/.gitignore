@@ -1,5 +1,8 @@
 env-setup/
 hw_run/
+build-cmake/
+gpu-simulator/build/
+gpu-simulator/bin/
 sim_run_*
 *.DS_Store*
 *.csv
