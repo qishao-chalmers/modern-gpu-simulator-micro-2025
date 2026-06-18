@@ -105,15 +105,51 @@ void subcore_issue_debug_sigint_handler(int) {
   g_subcore_issue_debug_sigint_pending = 1;
 }
 
+static bool is_memory_op_for_relaxed_barrier(const warp_inst_t *pI) {
+  if (pI == nullptr) {
+    return true;
+  }
+  return pI->is_load() || pI->is_store() || pI->is_texture() ||
+         pI->is_tensor_core_load_op() || pI->is_tensor_core_store_op();
+}
+
+static bool is_warp_blocked_by_programmer_barrier_for_issue(
+    SM *sm, shd_warp_t *warp, unsigned sm_warp_id, const warp_inst_t *pI,
+    const shader_core_config *config) {
+  if (warp->functional_done()) {
+    return true;
+  }
+  if (sm->warp_waiting_at_barrier(sm_warp_id)) {
+    if (config->is_relax_barriers_baseline &&
+        !is_memory_op_for_relaxed_barrier(pI)) {
+      // CTA barrier blocks only memory ops when relax is enabled.
+    } else {
+      return true;
+    }
+  }
+  if (sm->warp_waiting_at_mem_barrier(sm_warp_id)) {
+    return true;
+  }
+  if (sm->warp_waiting_grid_barrier(sm_warp_id)) {
+    return true;
+  }
+  return false;
+}
+
 const char *issue_debug_barrier_kind(SM *sm, shd_warp_t *warp,
-                                     unsigned sm_warp_id) {
+                                     unsigned sm_warp_id,
+                                     const warp_inst_t *pI,
+                                     const shader_core_config *config) {
   if (warp->functional_done()) {
     return "init";
   }
   if (sm->warp_waiting_at_barrier(sm_warp_id)) {
-    return "cta";
+    if (!config->is_relax_barriers_baseline ||
+        is_memory_op_for_relaxed_barrier(pI)) {
+      return "cta";
+    }
   }
-  if (warp->get_membar()) {
+  if (warp->get_membar() || sm->warp_waiting_at_mem_barrier(sm_warp_id)) {
     return "mem";
   }
   if (sm->warp_waiting_grid_barrier(sm_warp_id)) {
@@ -136,7 +172,8 @@ const char *issue_stall_primary_reason(
   }
   if (!are_switch_warp_conditions_ready) {
     if (!is_not_warp_waiting_in_programmer_barrier) {
-      const char *bk = issue_debug_barrier_kind(sm, warp, sm_warp_id);
+      const char *bk = issue_debug_barrier_kind(sm, warp, sm_warp_id, nullptr,
+                                                sm->get_config());
       if (strcmp(bk, "cta") == 0) return "cta_barrier";
       if (strcmp(bk, "mem") == 0) return "mem_barrier";
       if (strcmp(bk, "grid") == 0) return "grid_barrier";
@@ -762,7 +799,9 @@ void Subcore::issue(SM *shared_sm) {
         }
 
         bool is_not_warp_waiting_ldgdepbar = !is_waiting_ldgdepbar(pI, subcore_warp_id);
-        bool is_not_warp_waiting_in_programmer_barrier = !c_warp->waiting();
+        bool is_not_warp_waiting_in_programmer_barrier =
+            !is_warp_blocked_by_programmer_barrier_for_issue(
+                shared_sm, c_warp, sm_warp_id, pI, m_config);
         functional_unit* fu = get_fu(pI);
         bool is_fu_available = true;;
         bool is_fixed_latency_inst = fu->is_fixed_latency_unit();
@@ -831,7 +870,7 @@ void Subcore::issue(SM *shared_sm) {
                     sm_warp_id, pI);
           }
           const char *barrier_kind = issue_debug_barrier_kind(
-              shared_sm, c_warp, sm_warp_id);
+              shared_sm, c_warp, sm_warp_id, pI, m_config);
 
           bool is_inst_ready_to_issue_dbg = is_inst_ready_to_issue;
 
