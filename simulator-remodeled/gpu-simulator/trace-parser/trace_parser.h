@@ -165,6 +165,9 @@ class trace_parser {
 
   std::string get_extra_trace_info_filename() { return m_extra_trace_info_filename; } // MOD. Improved tracer
 
+
+  unsigned int get_kernel_id_filter_start() { return m_kernel_id_filter_start; }
+  unsigned int get_kernel_id_filter_end() { return m_kernel_id_filter_end; }
  private:
   std::string kernellist_filename;
   

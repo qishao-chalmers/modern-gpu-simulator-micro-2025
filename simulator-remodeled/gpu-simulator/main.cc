@@ -142,10 +142,20 @@ int main(int argc, const char **argv) {
       } else if (commandlist[i].m_type == command_type::kernel_launch) {
         // Read trace header info for window_size number of kernels
         kernel_trace_t* kernel_trace_info = tracer.parse_kernel_info(commandlist[i].command_string, m_gpgpu_sim->get_extra_trace_info());
-        kernel_info = create_kernel_info(kernel_trace_info, m_gpgpu_context, &tconfig, &tracer);
-        kernels_info.push_back(kernel_info);
-        std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;
-        i++;
+
+        // only kernel id in the range of kernel_id_filter_start and kernel_id_filter_end shall be parsed
+
+        if (kernel_trace_info->kernel_id >= tracer.get_kernel_id_filter_start() &&
+          kernel_trace_info->kernel_id <= tracer.get_kernel_id_filter_end()) {
+          kernel_info = create_kernel_info(kernel_trace_info, m_gpgpu_context, &tconfig, &tracer);
+          kernels_info.push_back(kernel_info);
+          std::cout << "Header info loaded for kernel command : " << commandlist[i].command_string << std::endl;
+          i++;
+        } else {
+          std::cout << "Kernel id " << kernel_trace_info->kernel_id << " is not in the range of kernel_id_filter_start and kernel_id_filter_end" << std::endl;
+          delete kernel_trace_info;
+          i++;
+        }
       }
       else{
         //unsupported commands will fail the simulation

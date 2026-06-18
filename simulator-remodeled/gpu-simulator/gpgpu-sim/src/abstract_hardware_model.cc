@@ -611,6 +611,9 @@ void warp_inst_t::generate_mem_latencies(gpgpu_sim *gpu) {
     }
   }else if(is_consider_global) {
     m_latency_of_mem_operation_at_sm_structure = shader_config.memory_l1d_minimum_latency;
+  }else if(space.get_type() == tex_space) {
+    // LDG.E.CONSTANT / read-only global (.nc) uses L1TEX at the SM memory unit.
+    m_latency_of_mem_operation_at_sm_structure = shader_config.memory_l1d_minimum_latency;
   }else if(space.is_const()) {
     m_latency_of_mem_operation_at_sm_structure = shader_config.constant_cache_latency_at_sm_structure;
   }

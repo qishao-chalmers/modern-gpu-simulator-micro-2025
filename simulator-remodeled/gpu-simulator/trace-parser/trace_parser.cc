@@ -73,6 +73,8 @@ void parseKernelAndStreamID(const std::string& commandString, int& kernelID, int
   kernelID = extractNumberAfterPattern(commandString, "kernel-");
   streamID = extractNumberAfterPattern(commandString, "streamid-");
   gpuDeviceID = extractNumberAfterPattern(commandString, "deviceid-");
+
+  printf("kernelID: %d, streamID: %d, gpuDeviceID: %d\n", kernelID, streamID, gpuDeviceID);
   assert(kernelID >= 0 && streamID >= 0 && gpuDeviceID >= 0);
 }
 
@@ -331,7 +333,9 @@ std::vector<trace_command> trace_parser::parse_commandlist_file() {
   std::vector<trace_command> commandlist;
   dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[0];
   unsigned int gpu_device_id = gpu_dev.id();
+  
   unsigned int kernel_id = 1;
+  //unsigned int kernel_id = m_kernel_id_filter_start;
   for(auto it_com : gpu_dev.streams()) {
     const dynamic_trace::cuda_stream& stream = it_com.second;
     for(int i = 0; i < stream.ordered_cuda_events_size(); ++i) {

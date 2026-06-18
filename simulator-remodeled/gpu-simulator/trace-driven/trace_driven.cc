@@ -393,6 +393,12 @@ bool trace_warp_inst_t::parse_from_trace_struct(
         space.set_type(local_space);
       else
         space.set_type(global_space);
+      // LDG.E.*.CONSTANT (ld.global.nc): read-only global via L1TEX, not mutable L1D.
+      if (m_opcode == OP_LDG &&
+          trace.check_opcode_contain(opcode_tokens, "CONSTANT")) {
+        space.set_type(tex_space);
+        mem_op = TEX;
+      }
       // check the cache scope, if its strong GPU, then bypass L1
       // Add for LDGSTS instruction
       if (m_opcode == OP_LDGSTS) {

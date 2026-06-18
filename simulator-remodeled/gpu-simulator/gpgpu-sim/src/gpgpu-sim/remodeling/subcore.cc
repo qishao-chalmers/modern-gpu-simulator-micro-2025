@@ -448,6 +448,42 @@ void Subcore::issue(SM *shared_sm) {
           }
         }
 
+        // Qi Lets print inst information and also all the conditions
+        // only print out the core id is 0
+        if(m_sm->get_sid() == 0 && m_subcore_id == 0 &&
+          c_warp->get_dynamic_warp_id() == 0) {
+          if(!are_switch_warp_conditions_ready && pI!=nullptr) {
+            std::stringstream ss;
+            pI->print_instruction_info(ss);
+            std::cout << shared_sm->get_gpu()->gpu_sim_cycle << " ";
+            std::cout << ss.str();
+            std::cout << " " << c_warp->get_warp_id() << "/";
+            std::cout <<c_warp->get_cta_id() << "/";
+            std::cout <<c_warp->get_dynamic_warp_id() << "/";
+            std::cout << " not ready because: ";
+            // print out short summary of the conditions
+            std::cout << " not yield: " << is_not_yield;
+            std::cout << " stall counter: " << is_stall_counter_0;
+            std::cout << " barriers: " << are_wait_barriers_ready;
+            std::cout << " fu_avail: " << is_fu_available;
+            std::cout << " prog_barrier: " << is_not_warp_waiting_in_programmer_barrier;
+            std::cout << " ldgdepbar: " << is_not_warp_waiting_ldgdepbar;
+            std::cout << " scoreboards: " << are_traditional_scoreaboards_ready;
+            std::cout << " result_queue: " << is_write_available_result_queue_for_fixed_latency_available;
+            std::cout << std::endl;
+          } else if (pI!=nullptr) {
+            std::cout << shared_sm->get_gpu()->gpu_sim_cycle << " ";
+            std::stringstream ss;
+            pI->print_instruction_info(ss);
+            std::cout << ss.str();
+            std::cout << " " << c_warp->get_warp_id() << "/";
+            std::cout <<c_warp->get_cta_id() << "/";
+            std::cout <<c_warp->get_dynamic_warp_id() << "/";
+            std::cout << " ready";
+            std::cout << std::endl;
+          }
+        }
+
         bool is_inst_ready_to_issue = are_switch_warp_conditions_ready && is_l1c_ready;
         if (is_inst_ready_to_issue) {
           const active_mask_t &active_mask =
@@ -507,6 +543,7 @@ void Subcore::issue(SM *shared_sm) {
   if(is_issued_inst) {
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_issuing"]->increment_with_integer(1);
   }else if(!is_next_stage_availabe){
+    // here we can also save the information of different instruction getting blocked by which kind of source
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_next_stage_not_available"]->increment_with_integer(1);
   }else if(is_issue_port_busy) { // IMAD.WIDE scenario
     shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_stall_issue_port_busy"]->increment_with_integer(1);
@@ -674,7 +711,7 @@ void Subcore::generate_fixed_latency_constant_accesses(warp_inst_t *pI) {
 bool Subcore::are_l1c_operands_ready(SM *shared_sm, const warp_inst_t *pI) {
   bool are_l1c_operands_ready = true;
   if(pI->get_generated_constant_accesses() && !pI->accessq_empty()) {
-    for(const auto mem_acc : pI->get_mem_accesses()) {
+    for(const auto& mem_acc : pI->get_mem_accesses()) {
       assert(mem_acc.get_type() == CONST_ACC_R);
       new_addr_type addr = mem_acc.get_addr();
       mem_fetch *mf = shared_sm->get_memf_fetch_allocator().alloc(*pI, mem_acc, shared_sm->get_current_gpu_cycle());

@@ -44,3 +44,8 @@ enum uarch_op_t {
   SPECIALIZED_UNIT_8_OP
 };
 typedef enum uarch_op_t op_type;
+
+
+extern const char* op_type_str[];
+
+const char* op_type_to_string(op_type op);
