@@ -784,6 +784,8 @@ class gpgpu_sim : public gpgpu_t {
   void update_stats();
   void deadlock_check();
   void inc_completed_cta() { gpu_completed_cta++; }
+  void request_simulation_stop() { m_request_stop = true; }
+  bool simulation_stop_requested() const { return m_request_stop; }
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 
@@ -915,6 +917,7 @@ class gpgpu_sim : public gpgpu_t {
 
   // debug
   bool gpu_deadlock;
+  bool m_request_stop;
 
   //// configuration parameters ////
   const gpgpu_sim_config &m_config;

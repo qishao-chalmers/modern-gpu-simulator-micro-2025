@@ -238,6 +238,37 @@ bool Scoreboard::checkCollision_remodeling(unsigned wid, const class warp_inst_t
   return false;
 }
 
+int Scoreboard::find_first_collision_remodeling(
+    unsigned wid, const class warp_inst_t *inst) const {
+  std::set<int> inst_regs;
+
+  for (unsigned int i = 0; i < inst->get_extra_trace_instruction_info().get_num_operands();
+       i++) {
+    traced_operand &op = inst->get_extra_trace_instruction_info().get_operand(i);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_is_trace_mode)) {
+      for (unsigned int j = 0;
+           j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), i, op_type);
+           j++) {
+        unsigned int final_reg_id =
+            translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j;
+        inst_regs.insert(final_reg_id);
+      }
+    }
+  }
+
+  for (std::set<int>::const_iterator it2 = inst_regs.begin(); it2 != inst_regs.end();
+       ++it2) {
+    if (reg_table[wid].find(*it2) != reg_table[wid].end()) {
+      return *it2;
+    }
+  }
+  return -1;
+}
+
 /**
  * Checks to see if registers used by an instruction are reserved in the
  *scoreboard

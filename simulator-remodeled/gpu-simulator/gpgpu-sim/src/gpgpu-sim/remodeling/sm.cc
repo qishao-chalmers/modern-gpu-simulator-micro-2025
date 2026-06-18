@@ -42,6 +42,7 @@
 
 #include "first_level_instruction_cache.h"
 #include "functional_unit.h"
+#include "subcore.h"
 #include "warp_dependency_state.h"
 
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
@@ -942,6 +943,9 @@ void SM::register_cta_thread_exit(unsigned cta_num, kernel_info_t *kernel) {
                         kernel->get_uid(), kernel->name().c_str(), m_sm_id);
 
           if (m_kernel == kernel) m_kernel = NULL;
+          if (m_sm_id == 0 && m_config->subcore_issue_debug) {
+            Subcore::print_issue_debug_summary();
+          }
           m_gpu->set_kernel_done(kernel);
         }
       }

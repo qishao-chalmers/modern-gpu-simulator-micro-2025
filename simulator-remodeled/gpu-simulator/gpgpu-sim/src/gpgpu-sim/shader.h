@@ -2022,6 +2022,10 @@ class shader_core_config : public core_config {
   bool is_trace_mode; // MOD. General Config Helper
   unsigned int filter_first_kernel_id; // If it has a value of 1 or 0 it is disabled
   unsigned int filter_last_kernel_id; // If it has a value of 1 or 0 it is disabled
+  bool subcore_issue_debug; // SM0/subcore0/warp0 issue-gate tracing
+  unsigned int subcore_issue_debug_summary_interval; // gpu cycles; 0=end only
+  unsigned int subcore_issue_debug_print_period; // verbose line every N logged cycles
+  unsigned long long subcore_issue_debug_stop_gpu_cycle; // 0=run to completion
 
 
   // MOD. Begin. Extended IBuffer

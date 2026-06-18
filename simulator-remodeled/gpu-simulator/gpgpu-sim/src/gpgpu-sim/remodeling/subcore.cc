@@ -27,7 +27,14 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <cassert>
+#include <csignal>
+#include <cstring>
+#include <iostream>
 #include <memory>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 #include "subcore.h"
 #include "functional_unit.h"
@@ -45,6 +52,354 @@
 
 #include "../../../../../util/traces_enhanced/src/traced_instruction.h"
 
+namespace {
+
+struct SubcoreIssueDebugStats {
+  unsigned kernel_uid = 0;
+  std::string kernel_name;
+  unsigned long long cycles_logged = 0;
+  unsigned long long cycles_switch_ready = 0;
+  unsigned long long cycles_issued = 0;
+  unsigned long long cycles_scoreboard = 0;
+  unsigned long long cycles_cta_barrier = 0;
+  unsigned long long cycles_mem_barrier = 0;
+  unsigned long long cycles_grid_barrier = 0;
+  unsigned long long cycles_init_wait = 0;
+  unsigned long long cycles_fu_busy = 0;
+  unsigned long long cycles_result_queue = 0;
+  unsigned long long cycles_l1c = 0;
+  unsigned long long cycles_dep_other = 0;
+
+  void reset(unsigned uid, const std::string &name) {
+    *this = SubcoreIssueDebugStats{};
+    kernel_uid = uid;
+    kernel_name = name;
+  }
+};
+
+SubcoreIssueDebugStats g_subcore_issue_debug_stats;
+unsigned g_subcore_issue_debug_last_kernel_uid = 0;
+unsigned long long g_subcore_issue_debug_last_summary_gpu_cycle = 0;
+bool g_subcore_issue_debug_stop_announced = false;
+volatile sig_atomic_t g_subcore_issue_debug_sigint_pending = 0;
+
+struct IssueStallHistogramState {
+  unsigned kernel_uid = 0;
+  std::string kernel_name;
+  std::unordered_map<std::string, std::unordered_map<std::string, unsigned long long>>
+      stall_by_op_reason;
+  std::unordered_map<std::string, unsigned long long> issued_by_op;
+
+  void reset(unsigned uid, const std::string &name) {
+    stall_by_op_reason.clear();
+    issued_by_op.clear();
+    kernel_uid = uid;
+    kernel_name = name;
+  }
+};
+
+IssueStallHistogramState g_issue_stall_histogram;
+unsigned g_issue_stall_histogram_last_kernel_uid = 0;
+
+void subcore_issue_debug_sigint_handler(int) {
+  g_subcore_issue_debug_sigint_pending = 1;
+}
+
+const char *issue_debug_barrier_kind(SM *sm, shd_warp_t *warp,
+                                     unsigned sm_warp_id) {
+  if (warp->functional_done()) {
+    return "init";
+  }
+  if (sm->warp_waiting_at_barrier(sm_warp_id)) {
+    return "cta";
+  }
+  if (warp->get_membar()) {
+    return "mem";
+  }
+  if (sm->warp_waiting_grid_barrier(sm_warp_id)) {
+    return "grid";
+  }
+  return "none";
+}
+
+const char *issue_stall_primary_reason(
+    SM *sm, shd_warp_t *warp, unsigned sm_warp_id,
+    bool are_switch_warp_conditions_ready, bool is_l1c_ready,
+    bool is_not_warp_waiting_in_programmer_barrier,
+    bool are_traditional_scoreaboards_ready, bool is_fu_available,
+    bool is_write_available_result_queue_for_fixed_latency_available,
+    bool is_not_yield, bool is_stall_counter_0, bool are_wait_barriers_ready,
+    bool is_not_warp_waiting_ldgdepbar) {
+  const bool is_inst_ready = are_switch_warp_conditions_ready && is_l1c_ready;
+  if (is_inst_ready) {
+    return "ready";
+  }
+  if (!are_switch_warp_conditions_ready) {
+    if (!is_not_warp_waiting_in_programmer_barrier) {
+      const char *bk = issue_debug_barrier_kind(sm, warp, sm_warp_id);
+      if (strcmp(bk, "cta") == 0) return "cta_barrier";
+      if (strcmp(bk, "mem") == 0) return "mem_barrier";
+      if (strcmp(bk, "grid") == 0) return "grid_barrier";
+      if (strcmp(bk, "init") == 0) return "init_wait";
+      return "prog_barrier";
+    }
+    if (!are_traditional_scoreaboards_ready) return "scoreboard";
+    if (!is_fu_available) return "fu_busy";
+    if (!is_write_available_result_queue_for_fixed_latency_available) {
+      return "result_queue";
+    }
+    if (!is_not_yield) return "yield";
+    if (!is_stall_counter_0) return "stall_counter";
+    if (!are_wait_barriers_ready) return "wait_barrier";
+    if (!is_not_warp_waiting_ldgdepbar) return "ldgdepbar";
+    return "dep_other";
+  }
+  if (!is_l1c_ready) return "l1c";
+  return "other";
+}
+
+void issue_stall_histogram_record(unsigned kernel_uid,
+                                  const std::string &kernel_name,
+                                  const char *op, const char *reason,
+                                  bool issued) {
+#pragma omp critical(issue_stall_histogram)
+  {
+    if (g_issue_stall_histogram_last_kernel_uid != kernel_uid) {
+      g_issue_stall_histogram.reset(kernel_uid, kernel_name);
+      g_issue_stall_histogram_last_kernel_uid = kernel_uid;
+    }
+    if (issued) {
+      g_issue_stall_histogram.issued_by_op[op]++;
+    } else {
+      g_issue_stall_histogram.stall_by_op_reason[op][reason]++;
+    }
+  }
+}
+
+void issue_stall_histogram_print_body(const char *tag,
+                                      unsigned long long gpu_cycle) {
+  IssueStallHistogramState snapshot;
+  unsigned snapshot_kernel_uid = 0;
+  std::string snapshot_kernel_name;
+  bool has_data = false;
+#pragma omp critical(issue_stall_histogram)
+  {
+    if (!g_issue_stall_histogram.stall_by_op_reason.empty() ||
+        !g_issue_stall_histogram.issued_by_op.empty()) {
+      snapshot = g_issue_stall_histogram;
+      snapshot_kernel_uid = g_issue_stall_histogram.kernel_uid;
+      snapshot_kernel_name = g_issue_stall_histogram.kernel_name;
+      has_data = true;
+    }
+  }
+  if (!has_data) {
+    return;
+  }
+
+  struct OpTotal {
+    std::string op;
+    unsigned long long stall_total;
+    unsigned long long issued_total;
+  };
+  std::vector<OpTotal> op_totals;
+  unsigned long long grand_stall = 0;
+
+  std::unordered_map<std::string, unsigned long long> stall_totals;
+  for (const auto &op_entry : snapshot.stall_by_op_reason) {
+    unsigned long long op_stall = 0;
+    for (const auto &reason_entry : op_entry.second) {
+      op_stall += reason_entry.second;
+    }
+    stall_totals[op_entry.first] = op_stall;
+    grand_stall += op_stall;
+    OpTotal t;
+    t.op = op_entry.first;
+    t.stall_total = op_stall;
+    t.issued_total = 0;
+    auto it = snapshot.issued_by_op.find(op_entry.first);
+    if (it != snapshot.issued_by_op.end()) {
+      t.issued_total = it->second;
+    }
+    op_totals.push_back(t);
+  }
+  for (const auto &issued_entry : snapshot.issued_by_op) {
+    if (stall_totals.find(issued_entry.first) == stall_totals.end()) {
+      OpTotal t;
+      t.op = issued_entry.first;
+      t.stall_total = 0;
+      t.issued_total = issued_entry.second;
+      op_totals.push_back(t);
+    }
+  }
+
+  std::sort(op_totals.begin(), op_totals.end(),
+            [](const OpTotal &a, const OpTotal &b) {
+              return a.stall_total > b.stall_total;
+            });
+
+  std::cout << "[issue_stall_stats] " << tag << " gpu_cycle=" << gpu_cycle
+            << " kernel uid=" << snapshot_kernel_uid
+            << " name=" << snapshot_kernel_name
+            << " (all SMs, per op_type at IBuffer head)\n";
+  std::cout << "  grand_stall_events=" << grand_stall << "\n";
+
+  for (const OpTotal &t : op_totals) {
+    std::cout << "  " << t.op << ": stall=" << t.stall_total
+              << " issued=" << t.issued_total << "\n";
+    auto op_it = snapshot.stall_by_op_reason.find(t.op);
+    if (op_it == snapshot.stall_by_op_reason.end()) {
+      continue;
+    }
+    std::vector<std::pair<std::string, unsigned long long>> reasons(
+        op_it->second.begin(), op_it->second.end());
+    std::sort(reasons.begin(), reasons.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    for (const auto &r : reasons) {
+      const double pct = (t.stall_total > 0)
+                             ? (100.0 * static_cast<double>(r.second) /
+                                static_cast<double>(t.stall_total))
+                             : 0.0;
+      std::cout << "    " << r.first << ": " << r.second << " (" << pct
+                << "%)\n";
+    }
+  }
+
+  struct PairTotal {
+    std::string op;
+    std::string reason;
+    unsigned long long count;
+  };
+  std::vector<PairTotal> pairs;
+  for (const auto &op_entry : snapshot.stall_by_op_reason) {
+    for (const auto &reason_entry : op_entry.second) {
+      pairs.push_back(
+          {op_entry.first, reason_entry.first, reason_entry.second});
+    }
+  }
+  std::sort(pairs.begin(), pairs.end(),
+            [](const PairTotal &a, const PairTotal &b) {
+              return a.count > b.count;
+            });
+  std::cout << "  top (op, reason) pairs:\n";
+  const unsigned top_n = std::min<unsigned>(15, pairs.size());
+  for (unsigned i = 0; i < top_n; i++) {
+    const double pct =
+        (grand_stall > 0)
+            ? (100.0 * static_cast<double>(pairs[i].count) /
+               static_cast<double>(grand_stall))
+            : 0.0;
+    std::cout << "    " << pairs[i].count << " (" << pct << "%)  "
+              << pairs[i].op << " / " << pairs[i].reason << "\n";
+  }
+  std::cout.flush();
+}
+
+void issue_debug_print_summary_body(const char *tag,
+                                    unsigned long long gpu_cycle) {
+  const SubcoreIssueDebugStats &s = g_subcore_issue_debug_stats;
+  if (s.cycles_logged > 0) {
+    auto pct = [&](unsigned long long n) {
+      return 100.0 * static_cast<double>(n) /
+             static_cast<double>(s.cycles_logged);
+    };
+    std::cout << "[subcore_issue_debug] " << tag << " gpu_cycle=" << gpu_cycle
+              << " kernel uid=" << s.kernel_uid << " name=" << s.kernel_name
+              << " SM0/subcore0/dyn_warp0 summary:\n";
+    std::cout << "  cycles_logged=" << s.cycles_logged << "\n";
+    std::cout << "  issued=" << s.cycles_issued << " ("
+              << pct(s.cycles_issued) << "%)\n";
+    std::cout << "  switch_ready=" << s.cycles_switch_ready << " ("
+              << pct(s.cycles_switch_ready) << "%)\n";
+    std::cout << "  scoreboard=" << s.cycles_scoreboard << " ("
+              << pct(s.cycles_scoreboard) << "%)\n";
+    std::cout << "  cta_barrier=" << s.cycles_cta_barrier << " ("
+              << pct(s.cycles_cta_barrier) << "%)\n";
+    std::cout << "  mem_barrier=" << s.cycles_mem_barrier << " ("
+              << pct(s.cycles_mem_barrier) << "%)\n";
+    std::cout << "  grid_barrier=" << s.cycles_grid_barrier << " ("
+              << pct(s.cycles_grid_barrier) << "%)\n";
+    std::cout << "  init_wait=" << s.cycles_init_wait << " ("
+              << pct(s.cycles_init_wait) << "%)\n";
+    std::cout << "  fu_busy=" << s.cycles_fu_busy << " ("
+              << pct(s.cycles_fu_busy) << "%)\n";
+    std::cout << "  result_queue=" << s.cycles_result_queue << " ("
+              << pct(s.cycles_result_queue) << "%)\n";
+    std::cout << "  l1c=" << s.cycles_l1c << " ("
+              << pct(s.cycles_l1c) << "%)\n";
+    std::cout << "  dep_other=" << s.cycles_dep_other << " ("
+              << pct(s.cycles_dep_other) << "%)\n";
+  }
+  issue_stall_histogram_print_body(tag, gpu_cycle);
+}
+
+void issue_debug_maybe_periodic_summary(const shader_core_config *config,
+                                      unsigned long long gpu_cycle) {
+  if (config->subcore_issue_debug_summary_interval == 0) {
+    return;
+  }
+  if (gpu_cycle < g_subcore_issue_debug_last_summary_gpu_cycle +
+                      config->subcore_issue_debug_summary_interval) {
+    return;
+  }
+  g_subcore_issue_debug_last_summary_gpu_cycle = gpu_cycle;
+  issue_debug_print_summary_body("partial", gpu_cycle);
+}
+
+void issue_debug_request_stop(gpgpu_sim *gpu, const char *reason,
+                              unsigned long long gpu_cycle) {
+  if (g_subcore_issue_debug_stop_announced) {
+    return;
+  }
+  g_subcore_issue_debug_stop_announced = true;
+  issue_debug_print_summary_body(reason, gpu_cycle);
+  gpu->request_simulation_stop();
+}
+
+void issue_debug_on_kernel_transition(unsigned new_uid,
+                                    const std::string &new_name) {
+  if (g_subcore_issue_debug_last_kernel_uid != 0 &&
+      g_subcore_issue_debug_last_kernel_uid != new_uid) {
+    issue_debug_print_summary_body("kernel_end", 0);
+  }
+  if (g_subcore_issue_debug_last_kernel_uid != new_uid) {
+    g_subcore_issue_debug_stats.reset(new_uid, new_name);
+    g_subcore_issue_debug_last_kernel_uid = new_uid;
+    g_subcore_issue_debug_last_summary_gpu_cycle = 0;
+    g_subcore_issue_debug_stop_announced = false;
+  }
+}
+
+}  // namespace
+
+void Subcore::install_issue_debug_sigint_handler() {
+  signal(SIGINT, subcore_issue_debug_sigint_handler);
+}
+
+void Subcore::print_issue_debug_summary() {
+  bool histogram_empty = true;
+#pragma omp critical(issue_stall_histogram)
+  {
+    histogram_empty = g_issue_stall_histogram.stall_by_op_reason.empty() &&
+                      g_issue_stall_histogram.issued_by_op.empty();
+  }
+  if (g_subcore_issue_debug_stats.cycles_logged == 0 && histogram_empty) {
+    return;
+  }
+  if (!g_subcore_issue_debug_stop_announced) {
+    issue_debug_print_summary_body("kernel_end", 0);
+  } else {
+    issue_stall_histogram_print_body("kernel_end", 0);
+  }
+  g_subcore_issue_debug_last_kernel_uid = 0;
+  g_subcore_issue_debug_stats.reset(0, "");
+  g_subcore_issue_debug_last_summary_gpu_cycle = 0;
+  g_subcore_issue_debug_stop_announced = false;
+#pragma omp critical(issue_stall_histogram)
+  {
+    g_issue_stall_histogram.reset(0, "");
+    g_issue_stall_histogram_last_kernel_uid = 0;
+  }
+}
 
 
 Subcore::Subcore(unsigned subcore_id, const shader_core_config *config,
@@ -448,44 +803,126 @@ void Subcore::issue(SM *shared_sm) {
           }
         }
 
-        // Qi Lets print inst information and also all the conditions
-        // only print out the core id is 0
-        if(m_sm->get_sid() == 0 && m_subcore_id == 0 &&
-          c_warp->get_dynamic_warp_id() == 0) {
-          if(!are_switch_warp_conditions_ready && pI!=nullptr) {
+        bool is_inst_ready_to_issue =
+            are_switch_warp_conditions_ready && is_l1c_ready;
+
+        // Qi: issue-gate debug on SM0/subcore0/dynamic warp 0 (-subcore_issue_debug 1)
+        if (m_config->subcore_issue_debug && m_sm->get_sid() == 0 &&
+            m_subcore_id == 0 && c_warp->get_dynamic_warp_id() == 0 &&
+            pI != nullptr) {
+          gpgpu_sim *gpu = shared_sm->get_gpu();
+          const unsigned long long gpu_cycle = gpu->gpu_sim_cycle;
+
+          if (g_subcore_issue_debug_sigint_pending) {
+            issue_debug_request_stop(gpu, "sigint", gpu_cycle);
+          }
+
+          issue_debug_on_kernel_transition(c_warp->get_kernel_info()->get_uid(),
+                                           c_warp->get_kernel_info()->name());
+          g_subcore_issue_debug_stats.cycles_logged++;
+
+          int raw_collision_reg = -1;
+          int war_collision_reg = -1;
+          if (use_traditional_scoreboarding && !are_traditional_scoreaboards_ready) {
+            raw_collision_reg = shared_sm->get_scoreboard()->find_first_collision_remodeling(
+                sm_warp_id, pI);
+            war_collision_reg =
+                shared_sm->get_scoreboard_WAR()->find_first_collision_remodeling(
+                    sm_warp_id, pI);
+          }
+          const char *barrier_kind = issue_debug_barrier_kind(
+              shared_sm, c_warp, sm_warp_id);
+
+          bool is_inst_ready_to_issue_dbg = is_inst_ready_to_issue;
+
+          if (is_inst_ready_to_issue_dbg) {
+            g_subcore_issue_debug_stats.cycles_switch_ready++;
+          } else if (!are_switch_warp_conditions_ready) {
+            if (!is_not_warp_waiting_in_programmer_barrier) {
+              if (strcmp(barrier_kind, "cta") == 0) {
+                g_subcore_issue_debug_stats.cycles_cta_barrier++;
+              } else if (strcmp(barrier_kind, "mem") == 0) {
+                g_subcore_issue_debug_stats.cycles_mem_barrier++;
+              } else if (strcmp(barrier_kind, "grid") == 0) {
+                g_subcore_issue_debug_stats.cycles_grid_barrier++;
+              } else if (strcmp(barrier_kind, "init") == 0) {
+                g_subcore_issue_debug_stats.cycles_init_wait++;
+              } else {
+                g_subcore_issue_debug_stats.cycles_dep_other++;
+              }
+            } else if (!are_traditional_scoreaboards_ready) {
+              g_subcore_issue_debug_stats.cycles_scoreboard++;
+            } else if (!is_fu_available) {
+              g_subcore_issue_debug_stats.cycles_fu_busy++;
+            } else if (!is_write_available_result_queue_for_fixed_latency_available) {
+              g_subcore_issue_debug_stats.cycles_result_queue++;
+            } else {
+              g_subcore_issue_debug_stats.cycles_dep_other++;
+            }
+          } else if (!is_l1c_ready) {
+            g_subcore_issue_debug_stats.cycles_l1c++;
+          }
+
+          issue_debug_maybe_periodic_summary(m_config, gpu_cycle);
+
+          if (m_config->subcore_issue_debug_stop_gpu_cycle > 0 &&
+              gpu_cycle >= m_config->subcore_issue_debug_stop_gpu_cycle) {
+            issue_debug_request_stop(gpu, "early_stop", gpu_cycle);
+          }
+
+          unsigned print_period = m_config->subcore_issue_debug_print_period;
+          if (print_period == 0) {
+            print_period = 1;
+          }
+          const bool emit_verbose_line =
+              (g_subcore_issue_debug_stats.cycles_logged % print_period) == 1;
+          if (emit_verbose_line) {
             std::stringstream ss;
             pI->print_instruction_info(ss);
-            std::cout << shared_sm->get_gpu()->gpu_sim_cycle << " ";
+            std::cout << gpu_cycle << " kuid="
+                      << c_warp->get_kernel_info()->get_uid() << " ";
             std::cout << ss.str();
             std::cout << " " << c_warp->get_warp_id() << "/";
-            std::cout <<c_warp->get_cta_id() << "/";
-            std::cout <<c_warp->get_dynamic_warp_id() << "/";
-            std::cout << " not ready because: ";
-            // print out short summary of the conditions
-            std::cout << " not yield: " << is_not_yield;
-            std::cout << " stall counter: " << is_stall_counter_0;
-            std::cout << " barriers: " << are_wait_barriers_ready;
-            std::cout << " fu_avail: " << is_fu_available;
-            std::cout << " prog_barrier: " << is_not_warp_waiting_in_programmer_barrier;
-            std::cout << " ldgdepbar: " << is_not_warp_waiting_ldgdepbar;
-            std::cout << " scoreboards: " << are_traditional_scoreaboards_ready;
-            std::cout << " result_queue: " << is_write_available_result_queue_for_fixed_latency_available;
-            std::cout << std::endl;
-          } else if (pI!=nullptr) {
-            std::cout << shared_sm->get_gpu()->gpu_sim_cycle << " ";
-            std::stringstream ss;
-            pI->print_instruction_info(ss);
-            std::cout << ss.str();
-            std::cout << " " << c_warp->get_warp_id() << "/";
-            std::cout <<c_warp->get_cta_id() << "/";
-            std::cout <<c_warp->get_dynamic_warp_id() << "/";
-            std::cout << " ready";
-            std::cout << std::endl;
+            std::cout << c_warp->get_cta_id() << "/";
+            std::cout << c_warp->get_dynamic_warp_id() << "/";
+            if (!is_inst_ready_to_issue_dbg) {
+              std::cout << " not ready because:";
+              std::cout << " not yield: " << is_not_yield;
+              std::cout << " stall counter: " << is_stall_counter_0;
+              std::cout << " barriers: " << are_wait_barriers_ready;
+              std::cout << " fu_avail: " << is_fu_available;
+              std::cout << " prog_barrier: "
+                        << is_not_warp_waiting_in_programmer_barrier;
+              std::cout << " barrier_kind: " << barrier_kind;
+              std::cout << " ldgdepbar: " << is_not_warp_waiting_ldgdepbar;
+              std::cout << " scoreboards: " << are_traditional_scoreaboards_ready;
+              if (raw_collision_reg >= 0) {
+                std::cout << " raw_reg: " << raw_collision_reg;
+              }
+              if (war_collision_reg >= 0) {
+                std::cout << " war_reg: " << war_collision_reg;
+              }
+              std::cout << " result_queue: "
+                        << is_write_available_result_queue_for_fixed_latency_available;
+              std::cout << " l1c_ready: " << is_l1c_ready;
+              std::cout << std::endl;
+            } else {
+              std::cout << " ready l1c_ready: " << is_l1c_ready << std::endl;
+            }
           }
         }
 
-        bool is_inst_ready_to_issue = are_switch_warp_conditions_ready && is_l1c_ready;
         if (is_inst_ready_to_issue) {
+          if (m_config->subcore_issue_debug) {
+            issue_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
+                                         c_warp->get_kernel_info()->name(),
+                                         op_type_to_string(pI->op), "ready",
+                                         true);
+          }
+          if (m_config->subcore_issue_debug && m_sm->get_sid() == 0 &&
+              m_subcore_id == 0 && c_warp->get_dynamic_warp_id() == 0) {
+            g_subcore_issue_debug_stats.cycles_issued++;
+          }
           const active_mask_t &active_mask =
               shared_sm->get_active_mask(sm_warp_id, pI);
           assert(c_warp->inst_in_pipeline());
@@ -499,7 +936,20 @@ void Subcore::issue(SM *shared_sm) {
           m_greedy_pointer_issue = subcore_warp_id;
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
           break;
-        }else {
+        } else {
+          if (m_config->subcore_issue_debug) {
+            const char *stall_reason = issue_stall_primary_reason(
+                shared_sm, c_warp, sm_warp_id, are_switch_warp_conditions_ready,
+                is_l1c_ready, is_not_warp_waiting_in_programmer_barrier,
+                are_traditional_scoreaboards_ready, is_fu_available,
+                is_write_available_result_queue_for_fixed_latency_available,
+                is_not_yield, is_stall_counter_0, are_wait_barriers_ready,
+                is_not_warp_waiting_ldgdepbar);
+            issue_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
+                                         c_warp->get_kernel_info()->name(),
+                                         op_type_to_string(pI->op), stall_reason,
+                                         false);
+          }
           if(!are_switch_warp_conditions_ready) {
             // has_been_possible_to_switch_warp = true;
             // if(!is_fu_available) {

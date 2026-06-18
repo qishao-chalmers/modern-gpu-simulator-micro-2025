@@ -90,6 +90,9 @@ class Subcore {
 
   bool is_subcore_with_problems_of_fordward_progress() const;
 
+  static void print_issue_debug_summary();
+  static void install_issue_debug_sigint_handler();
+
  private:
   int m_num_active_warps_subcore;
   first_level_instruction_cache* m_L0I;

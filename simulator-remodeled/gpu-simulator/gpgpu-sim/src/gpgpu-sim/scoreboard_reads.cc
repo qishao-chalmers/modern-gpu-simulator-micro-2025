@@ -241,6 +241,71 @@ bool Scoreboard_reads::checkCollision_remodeling(unsigned wid, const class warp_
   return false;
 }
 
+int Scoreboard_reads::find_first_collision_remodeling(
+    unsigned wid, const class warp_inst_t *inst) const {
+  if (!m_enabled) {
+    return -1;
+  }
+
+  std::set<int> inst_regs_out;
+  unsigned int num_dsts =
+      inst->get_extra_trace_instruction_info().get_num_destination_registers();
+
+  for (unsigned int iii = 0; iii < num_dsts; iii++) {
+    traced_operand &op = inst->get_extra_trace_instruction_info().get_operand(iii);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_is_trace_mode)) {
+      for (unsigned int j = 0;
+           j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), iii, op_type);
+           j++) {
+        unsigned int final_reg_id =
+            translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j;
+        inst_regs_out.insert(final_reg_id);
+      }
+    }
+  }
+
+  for (std::set<int>::const_iterator it = inst_regs_out.begin();
+       it != inst_regs_out.end(); ++it) {
+    if (reg_table[wid].find(*it) != reg_table[wid].end()) {
+      return *it;
+    }
+  }
+
+  std::set<int> inst_regs_in;
+  for (unsigned int iii = num_dsts;
+       iii < inst->get_extra_trace_instruction_info().get_num_operands(); iii++) {
+    traced_operand &op = inst->get_extra_trace_instruction_info().get_operand(iii);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_is_trace_mode)) {
+      for (unsigned int j = 0;
+           j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), iii, op_type);
+           j++) {
+        unsigned int final_reg_id =
+            translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j;
+        inst_regs_in.insert(final_reg_id);
+      }
+    }
+  }
+
+  for (std::set<int>::const_iterator it_in_check = inst_regs_in.begin();
+       it_in_check != inst_regs_in.end(); ++it_in_check) {
+    std::map<unsigned, unsigned>::const_iterator it_aux =
+        reg_table[wid].find(*it_in_check);
+    if ((it_aux != reg_table[wid].end()) &&
+        (it_aux->second == m_scoreboard_war_max_uses_per_reg)) {
+      return *it_in_check;
+    }
+  }
+
+  return -1;
+}
 
 bool Scoreboard_reads::isEnabled()
 {

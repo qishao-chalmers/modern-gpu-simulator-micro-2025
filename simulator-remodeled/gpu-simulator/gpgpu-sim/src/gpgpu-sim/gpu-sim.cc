@@ -1327,6 +1327,26 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                           &filter_last_kernel_id, "If enabled, the simulation will end at the last kernel id configured in this parameter. If it has a value of 1 or 0 it is disabled."
                           "Configure to any positive number (default=0)",
                           "0");
+  option_parser_register(opp, "-subcore_issue_debug", OPT_BOOL,
+                          &subcore_issue_debug,
+                          "Trace issue-gate stalls on SM0/subcore0/dynamic warp 0 and "
+                          "print per-kernel stall cycle summary (default=0)",
+                          "0");
+  option_parser_register(opp, "-subcore_issue_debug_summary_interval", OPT_UINT32,
+                          &subcore_issue_debug_summary_interval,
+                          "While -subcore_issue_debug is on, print cumulative stall "
+                          "summary every N gpu_sim cycles on SM0 (0=kernel end only)",
+                          "0");
+  option_parser_register(opp, "-subcore_issue_debug_print_period", OPT_UINT32,
+                          &subcore_issue_debug_print_period,
+                          "Emit verbose per-cycle issue lines every N logged cycles "
+                          "on SM0/subcore0/warp0 (1=every cycle, 0=treat as 1)",
+                          "1");
+  option_parser_register(opp, "-subcore_issue_debug_stop_gpu_cycle", OPT_UINT64,
+                          &subcore_issue_debug_stop_gpu_cycle,
+                          "Stop simulation after this gpu_sim cycle and print stall "
+                          "summary (0=disabled; use with k3-only filter)",
+                          "0");
   // MOD. Begin. InterWarp coalescing
   option_parser_register(opp, "-measure_coalescing_potential_stats", OPT_BOOL,
     &measure_coalescing_potential_stats,
@@ -1668,7 +1688,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     m_coalescing_stats_across_sms_l1d("l1d", _memory_space_t::global_space),
     m_coalescing_stats_across_sms_const("const", _memory_space_t::const_space),
     m_coalescing_stats_across_sms_sharedmem("sharedMem", _memory_space_t::shared_space),
-    m_config(config)  {
+    m_config(config), m_request_stop(false)  {
   gpgpu_ctx = ctx;
   m_shader_config = &m_config.m_shader_config;
   m_memory_config = &m_config.m_memory_config;
@@ -1966,6 +1986,7 @@ void gpgpu_sim::reinit_clock_domains(void) {
 }
 
 bool gpgpu_sim::active() {
+  if (m_request_stop) return false;
   if (m_config.gpu_max_cycle_opt &&
       (gpu_tot_sim_cycle + gpu_sim_cycle) >= m_config.gpu_max_cycle_opt)
     return false;
@@ -1992,6 +2013,7 @@ bool gpgpu_sim::active() {
 
 void gpgpu_sim::init() {
   // run a CUDA grid on the GPU microarchitecture simulator
+  m_request_stop = false;
   gpu_sim_cycle = 0;
   dram_sim_cycle = 0;
   gpu_sim_insn = 0;

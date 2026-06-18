@@ -62,6 +62,8 @@ class Scoreboard_reads {
 
   bool checkCollision(unsigned wid, const inst_t *inst) const;
   bool checkCollision_remodeling(unsigned wid, const warp_inst_t *inst) const;
+  int find_first_collision_remodeling(unsigned wid,
+                                      const warp_inst_t *inst) const;
   bool pendingReads(unsigned wid) const;
   void printContents() const;
 

@@ -47,6 +47,8 @@
 #include "../trace-parser/trace_parser.h"
 #include "accelsim_version.h"
 
+#include "gpgpu-sim/remodeling/subcore.h"
+
 #include <omp.h>
 
 #include <signal.h>
@@ -89,6 +91,10 @@ int main(int argc, const char **argv) {
       gpgpu_trace_sim_init_perf_model(argc, argv, m_gpgpu_context, &tconfig, opp);
   m_gpgpu_sim->init();
   
+  if (m_gpgpu_sim->getShaderCoreConfig()->subcore_issue_debug) {
+    Subcore::install_issue_debug_sigint_handler();
+  }
+
   m_gpgpu_sim->m_current_omp_scheduler = omp_sched_t::omp_sched_static;
   omp_set_schedule(m_gpgpu_sim->m_current_omp_scheduler, 1);
 
@@ -197,6 +203,10 @@ int main(int argc, const char **argv) {
       }
       active = m_gpgpu_sim->active();
       finished_kernel_uid = m_gpgpu_sim->finished_kernel();
+
+      if (m_gpgpu_sim->simulation_stop_requested()) {
+        can_continue_simulation = false;
+      }
 
       if (!active || finished_kernel_uid || is_cta_max_hit) {
         break;
