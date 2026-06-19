@@ -96,6 +96,7 @@ void warp_inst_t::issue(const active_mask_t &mask, unsigned warp_id,
   m_cache_hit = false;
   m_empty = false;
   m_scheduler_id = sch_id;
+  m_scoreboard_released_at_ex = false;
 }
 
 void warp_inst_t::set_some_warp_attributes(unsigned int warp_id, unsigned int dynamic_warp_id) {
@@ -439,6 +440,13 @@ void warp_inst_t::generate_tensor_core_latencies(gpgpu_sim *gpu) {
   if(get_extra_trace_instruction_info().get_tensor_core_instruction_info().is_16816_fp32_1688_fp32) {
     initiation_interval += gpu->get_config().get_gpgpu_sim_config().tensor_extra_latency_16816_fp32_1688_fp32;
     latency += gpu->get_config().get_gpgpu_sim_config().tensor_extra_latency_16816_fp32_1688_fp32;
+  }
+  const shader_core_config &sc = gpu->get_config().get_gpgpu_sim_config();
+  if (sc.tensor_initiation_cycles_override > 0) {
+    initiation_interval = sc.tensor_initiation_cycles_override;
+  }
+  if (sc.tensor_dependent_latency_override > 0) {
+    latency = sc.tensor_dependent_latency_override;
   }
 }
 

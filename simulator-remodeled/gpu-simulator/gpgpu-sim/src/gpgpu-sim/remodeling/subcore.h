@@ -35,6 +35,8 @@
 #include <vector>
 #include <queue>
 #include <memory>
+#include <string>
+#include <utility>
 #include "../../constants.h"
 #include "../shader.h"
 #include "register_file.h"
@@ -118,6 +120,13 @@ class Subcore {
   unsigned int m_greedy_pointer_fetch;
 
   bool m_is_next_stage_of_issue_busy;
+
+  // Qi: debug-only buffer of (op, reason) stall events recorded during this
+  // cycle's issue() warp scan, classified as "starved" (no warp in this
+  // subcore issued anything this cycle) only after the scan finishes.
+  std::vector<std::pair<std::string, std::string>> m_debug_stall_events_this_cycle;
+  unsigned m_debug_stall_events_kernel_uid = 0;
+  std::string m_debug_stall_events_kernel_name;
 
   register_set_uniptr m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch");
   register_set_uniptr m_CONTROL_ALLOCATE_latch = register_set_uniptr(1, "CONTROL_ALLOCATE_latch");

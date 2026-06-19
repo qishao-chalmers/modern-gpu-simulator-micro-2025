@@ -158,6 +158,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void add_pending_wait_barrier_decrement(warp_inst_t *inst, Wait_Barrier_Type barrier_type, unsigned int barrier_id);
   void add_pending_wait_barrier_increment(warp_inst_t *inst, Wait_Barrier_Type barrier_type, unsigned int barrier_id);
   void instruction_retirement(warp_inst_t *instruction);
+  void release_scoreboard_registers(warp_inst_t *instruction);
+  void maybe_release_scoreboard_at_ex(warp_inst_t *instruction);
   void issue_warp(register_set_uniptr &warp, warp_inst_t *pI,
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned subcore_id, bool use_traditional_scoreboarding);
@@ -339,6 +341,7 @@ class SM : public core_t, public shader_core_ctx_wrapper {
 
   unsigned long long m_last_inst_gpu_sim_cycle;
   unsigned long long m_last_inst_gpu_tot_sim_cycle;
+  unsigned long long m_committed_inst_count_progress;  // Qi: SM0-only commit-progress counter
 
   const shader_core_config *m_config;
   const memory_config *m_memory_config;

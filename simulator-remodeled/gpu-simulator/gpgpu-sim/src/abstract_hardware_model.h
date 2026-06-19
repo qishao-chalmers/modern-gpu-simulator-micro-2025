@@ -1334,6 +1334,7 @@ class warp_inst_t : public inst_t {
     m_num_cycles_to_stall_SM = 0;
     m_prt_assigned = false;
     m_prt_id = std::numeric_limits<unsigned int>::max();
+    m_scoreboard_released_at_ex = false;
   }
   warp_inst_t(const core_config *config) {
     m_uid = 0;
@@ -1371,6 +1372,7 @@ class warp_inst_t : public inst_t {
     m_num_cycles_to_stall_SM = 0;
     m_prt_assigned = false;
     m_prt_id = std::numeric_limits<unsigned int>::max();
+    m_scoreboard_released_at_ex = false;
   }
   virtual ~warp_inst_t() {}
 
@@ -1394,7 +1396,10 @@ class warp_inst_t : public inst_t {
   void broadcast_barrier_reduction(const active_mask_t &access_mask);
   void do_atomic(bool forceDo = false);
   void do_atomic(const active_mask_t &access_mask, bool forceDo = false);
-  void clear() { m_empty = true; }
+  void clear() {
+    m_empty = true;
+    m_scoreboard_released_at_ex = false;
+  }
 
   void set_some_warp_attributes(unsigned int warp_id, unsigned int dynamic_warp_id);
   void issue(const active_mask_t &mask, unsigned warp_id,
@@ -1736,6 +1741,7 @@ class warp_inst_t : public inst_t {
   unsigned int m_latency_of_mem_operation_at_sm_structure;
   std::vector<unsigned int> m_num_cycles_per_intermediate_stage; // Just used if the instruction goes to a functional unit of queue type
   unsigned int m_num_cycles_to_wait_to_free_WAR;
+  bool m_scoreboard_released_at_ex;
 };
 
 void move_warp(warp_inst_t *&dst, warp_inst_t *&src);

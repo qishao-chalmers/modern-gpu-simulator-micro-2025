@@ -230,11 +230,13 @@ bool functional_unit::instruction_finishing_execution(std::unique_ptr<warp_inst_
       retired = true;
     } else {
       if(is_fixed_latency_unit()) {
-        assert(m_rf_write_queue->has_free());  
+        assert(m_rf_write_queue->has_free());
+        m_sm->maybe_release_scoreboard_at_ex(pipe_reg_target.get());
         m_rf_write_queue->move_in(pipe_reg_target);   
         retired = true;
       }else {
         if(m_rf_write_queue->has_free()) {
+          m_sm->maybe_release_scoreboard_at_ex(pipe_reg_target.get());
           m_rf_write_queue->move_in(pipe_reg_target);
           retired = true;
         }

@@ -829,6 +829,23 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &is_relax_barriers_baseline,
                          "If enabled, after a barrier only memory operations will stall a warp when this is waiting in a barrier (default = disabled)",
                          "0");
+
+  // Qi: alternate subcore issue-priority policy. Default (0) keeps the
+  // existing greedy-then-highest-id behavior (the issuing warp keeps
+  // priority next cycle as long as it stays ready). When enabled, the
+  // priority pointer instead advances to the next warp every cycle
+  // regardless of who issued, giving true round-robin fairness across the
+  // warps resident in a subcore.
+  option_parser_register(opp, "-is_subcore_round_robin_issue_scheduler", OPT_BOOL,
+                         &is_subcore_round_robin_issue_scheduler,
+                         "If enabled, subcore issue priority rotates every cycle (round-robin) instead of sticking to the warp that last issued (greedy-then-highest-id baseline) (default = disabled)",
+                         "0");
+  option_parser_register(opp, "-is_scoreboard_release_at_ex", OPT_BOOL,
+                         &is_scoreboard_release_at_ex,
+                         "If enabled, release scoreboard destination registers when an instruction "
+                         "finishes FU execution (operand-forwarding model), instead of waiting for "
+                         "RF writeback retirement (default = disabled)",
+                         "0");
   // MOD. End
 
   // MOD. Begin. Extended IBuffer
@@ -985,6 +1002,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &tensor_rate_per_cycle, "Rate of processing of the tensor cores per cycle."
                          "Configure to any positive number (default=2048)",
                          "2048");
+  option_parser_register(opp, "-tensor_initiation_cycles_override", OPT_INT32,
+                         &tensor_initiation_cycles_override,
+                         "When >0, override IMMA initiation interval after formula (H100 ubench ~2 cyc). "
+                         "0=use formula (default=0)",
+                         "0");
+  option_parser_register(opp, "-tensor_dependent_latency_override", OPT_INT32,
+                         &tensor_dependent_latency_override,
+                         "When >0, override IMMA dependent latency after formula (H100 ubench ~24 cyc). "
+                         "0=use formula (default=0)",
+                         "0");
   option_parser_register(opp, "-branch_latency", OPT_INT32,
                          &branch_latency, "Latency of the branch instructions."
                          "Configure to any positive number (default=1)",

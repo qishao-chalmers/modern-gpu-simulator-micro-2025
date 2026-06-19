@@ -115,6 +115,7 @@ SM::SM(unsigned int num_subcores, gpgpu_sim *gpu, simt_core_cluster *cluster,
   m_num_subcores = num_subcores;
   m_last_inst_gpu_sim_cycle = 0;
   m_last_inst_gpu_tot_sim_cycle = 0;
+  m_committed_inst_count_progress = 0;
   // Jin: for concurrent kernels on a SM
   m_occupied_n_threads = 0;
   m_occupied_shmem = 0;
@@ -300,28 +301,75 @@ void SM::add_pending_wait_barrier_increment(warp_inst_t *inst,
 }
 
 
-void SM::instruction_retirement(warp_inst_t *instruction) {
+void SM::release_scoreboard_registers(warp_inst_t *instruction) {
   unsigned int warp_id = instruction->warp_id();
-  // if(m_sm_id == 0 && warp_id == 0) { {
-  //   std::cout << "WB. SM: " << m_sm_id << ". Subcore: " << instruction->get_subcore_id() << ". Warp_ID: " << warp_id << ". PC: " << std::hex << instruction->pc << std::dec << ". Cycle: " << get_current_gpu_cycle() << std::endl;
-  //   fflush(stdout);
-  // }
-  bool use_traditional_scoreboarding = !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary;
+  bool use_traditional_scoreboarding =
+      !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary;
   if (use_traditional_scoreboarding ||
-    m_config->is_remodeling_scoreboarding_enabled ||
-    !m_config->is_trace_mode) {
-    if ( (use_traditional_scoreboarding && m_config->is_trace_mode) || (m_config->is_trace_mode && m_config->is_remodeling_scoreboarding_enabled) ) {
-      if ((m_scoreboard_WAR->getMode() ==
-           scoreboard_reads_mode::RELEASE_AT_WB)) {
+      m_config->is_remodeling_scoreboarding_enabled || !m_config->is_trace_mode) {
+    if ((use_traditional_scoreboarding && m_config->is_trace_mode) ||
+        (m_config->is_trace_mode &&
+         m_config->is_remodeling_scoreboarding_enabled)) {
+      if ((m_scoreboard_WAR->getMode() == scoreboard_reads_mode::RELEASE_AT_WB)) {
         m_scoreboard_WAR->releaseRegisters_remodeling(instruction);
       }
       m_scoreboard->releaseRegisters_remodeling(instruction);
     } else {
-      if ((m_scoreboard_WAR->getMode() ==
-           scoreboard_reads_mode::RELEASE_AT_WB)) {
+      if ((m_scoreboard_WAR->getMode() == scoreboard_reads_mode::RELEASE_AT_WB)) {
         m_scoreboard_WAR->releaseRegisters(instruction);
       }
       m_scoreboard->releaseRegisters(instruction);
+    }
+  }
+}
+
+void SM::maybe_release_scoreboard_at_ex(warp_inst_t *instruction) {
+  if (!m_config->is_scoreboard_release_at_ex) {
+    return;
+  }
+  if (!instruction->get_extra_trace_instruction_info().has_destination_registers()) {
+    return;
+  }
+  if (instruction->m_scoreboard_released_at_ex) {
+    return;
+  }
+  release_scoreboard_registers(instruction);
+  instruction->m_scoreboard_released_at_ex = true;
+  unsigned int warp_id = instruction->warp_id();
+  if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
+    printf("[ex_release_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
+           m_sm_id, instruction->get_subcore_id(), warp_id, instruction->pc,
+           op_type_to_string(instruction->op),
+           m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+    fflush(stdout);
+  }
+}
+
+void SM::instruction_retirement(warp_inst_t *instruction) {
+  unsigned int warp_id = instruction->warp_id();
+  // Qi: per-warp committed-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
+  if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
+    printf("[commit_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
+           m_sm_id, instruction->get_subcore_id(), warp_id,
+           instruction->pc, op_type_to_string(instruction->op),
+           m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+  }
+  // Qi: always-on SM0 commit-progress heartbeat, every 1k committed instructions
+  if (m_sm_id == 0) {
+    m_committed_inst_count_progress++;
+    if (m_committed_inst_count_progress % 1000 == 0) {
+      printf("[commit_progress] sm=0 committed_insts=%llu cycle=%llu\n",
+             m_committed_inst_count_progress,
+             m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+      fflush(stdout);
+    }
+  }
+  bool use_traditional_scoreboarding = !m_physical_warp[warp_id]->get_kernel_info()->is_captured_from_binary;
+  if (use_traditional_scoreboarding ||
+    m_config->is_remodeling_scoreboarding_enabled ||
+    !m_config->is_trace_mode) {
+    if (!instruction->m_scoreboard_released_at_ex) {
+      release_scoreboard_registers(instruction);
     }
 
   } else {
@@ -366,10 +414,13 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   
   func_exec_inst(*pipe_reg);
 
-  // if(m_sm_id == 0 && warp_id == 0) { //&& get_stats()->m_last_kernel_id == 11) { // && warp_id == 0) {
-  //   std::cout << "Issue. SM: " << m_sm_id << ". Subcore: " << subcore_id << ". Warp_ID: " << warp_id << ". PC: " << std::hex << pipe_reg->pc << ". Next traced PC:" << pipe_reg->next_traced_pc << std::dec << ". Cycle: " << get_current_gpu_cycle() << std::endl;
-  //   fflush(stdout);
-  // }
+  // Qi: per-warp issued-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
+  if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
+    printf("[issue_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
+           m_sm_id, subcore_id, warp_id, pipe_reg->pc,
+           op_type_to_string(pipe_reg->op),
+           m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+  }
 
   // if(m_sm_id == 0 && subcore_id == 0 && ((*pipe_reg)->pc==0x260 || (*pipe_reg)->pc==0x2c0)) { // && warp_id == 0) {
   //   std::cout << "Measure. Issue. SM: " << m_sm_id << ". Subcore: " << subcore_id << ". Warp_ID: " << warp_id << ". PC: " << std::hex << (*pipe_reg)->pc << std::dec << ". Cycle: " << get_current_gpu_cycle() << std::endl;
@@ -392,7 +443,15 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     }
     m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());
     m_barriers.warp_reaches_barrier(m_physical_warp[warp_id]->get_cta_id(),
-                                    warp_id, pipe_reg.get());    
+                                    warp_id, pipe_reg.get());
+    // Qi: per-warp barrier-arrival tracing for SM0/CTA0, all 8 warps (-subcore_issue_debug 1)
+    if (m_config->subcore_issue_debug && m_sm_id == 0 &&
+        m_physical_warp[warp_id]->get_cta_id() == 0 &&
+        pipe_reg->op == BARRIER_OP) {
+      printf("[bar_arrival_trace] warp=%u dyn_warp=%u pc=0x%x cycle=%llu\n",
+             warp_id, m_physical_warp[warp_id]->get_dynamic_warp_id(),
+             pipe_reg->pc, m_gpu->gpu_sim_cycle);
+    }
   }else if(pipe_reg->op == GRID_BARRIER_OP) {
     m_physical_warp[warp_id]->set_gridbar();
     m_physical_warp[warp_id]->store_info_of_last_inst_at_barrier(pipe_reg.get());

@@ -2016,6 +2016,8 @@ class shader_core_config : public core_config {
   int cu_num_ports; // MOD. Improving OPC
   bool is_skip_rf_limit_enabled; // MOD. Skip RF limitation.
   bool is_relax_barriers_baseline; // MOD. Relax barriers in baseline
+  bool is_subcore_round_robin_issue_scheduler; // Qi: round-robin subcore issue priority instead of greedy-then-highest-id
+  bool is_scoreboard_release_at_ex; // Qi: release scoreboard at FU completion (EX), not RF writeback
 
   concrete_scheduler warp_scheduling_mode;
 
@@ -2070,6 +2072,8 @@ class shader_core_config : public core_config {
   int tensor_latency;
   int tensor_extra_latency_16816_fp32_1688_fp32;
   int tensor_rate_per_cycle;
+  int tensor_initiation_cycles_override;
+  int tensor_dependent_latency_override;
   int branch_latency;
   int half_latency;
   int uniform_latency;

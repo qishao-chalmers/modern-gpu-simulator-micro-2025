@@ -101,6 +101,113 @@ struct IssueStallHistogramState {
 IssueStallHistogramState g_issue_stall_histogram;
 unsigned g_issue_stall_histogram_last_kernel_uid = 0;
 
+// Qi: starvation cross-check. For every (op, reason) stall event already
+// counted in g_issue_stall_histogram, additionally tracks how many of those
+// events happened on a cycle where the *whole subcore* issued nothing at
+// all that cycle ("starved": no other resident warp had a ready
+// instruction either) versus a cycle where some other warp in the same
+// subcore did issue (the stalled warp just lost arbitration).
+struct StarvationHistogramState {
+  unsigned kernel_uid = 0;
+  std::string kernel_name;
+  std::unordered_map<std::string, std::unordered_map<std::string, unsigned long long>>
+      starved_stall_by_op_reason;
+  unsigned long long subcore_cycles_evaluated = 0;
+  unsigned long long subcore_cycles_starved = 0;
+
+  void reset(unsigned uid, const std::string &name) {
+    *this = StarvationHistogramState{};
+    kernel_uid = uid;
+    kernel_name = name;
+  }
+};
+
+StarvationHistogramState g_starvation_histogram;
+unsigned g_starvation_histogram_last_kernel_uid = 0;
+
+void starvation_histogram_record_cycle(
+    unsigned kernel_uid, const std::string &kernel_name,
+    const std::vector<std::pair<std::string, std::string>> &stalled_this_cycle,
+    bool subcore_issued_something) {
+#pragma omp critical(starvation_histogram)
+  {
+    if (g_starvation_histogram_last_kernel_uid != kernel_uid) {
+      g_starvation_histogram.reset(kernel_uid, kernel_name);
+      g_starvation_histogram_last_kernel_uid = kernel_uid;
+    }
+    g_starvation_histogram.subcore_cycles_evaluated++;
+    if (!subcore_issued_something) {
+      g_starvation_histogram.subcore_cycles_starved++;
+      for (const auto &ev : stalled_this_cycle) {
+        g_starvation_histogram.starved_stall_by_op_reason[ev.first][ev.second]++;
+      }
+    }
+  }
+}
+
+void starvation_histogram_print_body(const char *tag,
+                                     unsigned long long gpu_cycle) {
+  StarvationHistogramState snapshot;
+  IssueStallHistogramState stall_snapshot;
+  bool has_data = false;
+#pragma omp critical(starvation_histogram)
+  {
+    if (g_starvation_histogram.subcore_cycles_evaluated > 0) {
+      snapshot = g_starvation_histogram;
+      has_data = true;
+    }
+  }
+  if (!has_data) {
+    return;
+  }
+#pragma omp critical(issue_stall_histogram)
+  { stall_snapshot = g_issue_stall_histogram; }
+
+  std::cout << "[starvation_stats] " << tag << " gpu_cycle=" << gpu_cycle
+            << " kernel uid=" << snapshot.kernel_uid
+            << " name=" << snapshot.kernel_name
+            << " (all SMs, per subcore-cycle)\n";
+  double starved_pct = 100.0 * (double)snapshot.subcore_cycles_starved /
+                       (double)snapshot.subcore_cycles_evaluated;
+  std::cout << "  subcore_cycles_evaluated=" << snapshot.subcore_cycles_evaluated
+            << " subcore_cycles_starved=" << snapshot.subcore_cycles_starved
+            << " (" << starved_pct << "%)\n";
+  std::cout << "  per (op,reason): starved_count / total_stall_count (starved %% of that reason's stalls)\n";
+
+  struct Row {
+    std::string op;
+    std::string reason;
+    unsigned long long starved;
+    unsigned long long total;
+  };
+  std::vector<Row> rows;
+  for (const auto &op_entry : snapshot.starved_stall_by_op_reason) {
+    for (const auto &reason_entry : op_entry.second) {
+      Row r;
+      r.op = op_entry.first;
+      r.reason = reason_entry.first;
+      r.starved = reason_entry.second;
+      r.total = 0;
+      auto op_it = stall_snapshot.stall_by_op_reason.find(r.op);
+      if (op_it != stall_snapshot.stall_by_op_reason.end()) {
+        auto reason_it = op_it->second.find(r.reason);
+        if (reason_it != op_it->second.end()) {
+          r.total = reason_it->second;
+        }
+      }
+      rows.push_back(r);
+    }
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+    return a.starved > b.starved;
+  });
+  for (const Row &r : rows) {
+    double pct = r.total > 0 ? 100.0 * (double)r.starved / (double)r.total : 0.0;
+    std::cout << "    " << r.op << " / " << r.reason << ": starved=" << r.starved
+              << " total=" << r.total << " (" << pct << "%)\n";
+  }
+}
+
 void subcore_issue_debug_sigint_handler(int) {
   g_subcore_issue_debug_sigint_pending = 1;
 }
@@ -367,6 +474,7 @@ void issue_debug_print_summary_body(const char *tag,
               << pct(s.cycles_dep_other) << "%)\n";
   }
   issue_stall_histogram_print_body(tag, gpu_cycle);
+  starvation_histogram_print_body(tag, gpu_cycle);
 }
 
 void issue_debug_maybe_periodic_summary(const shader_core_config *config,
@@ -426,6 +534,7 @@ void Subcore::print_issue_debug_summary() {
     issue_debug_print_summary_body("kernel_end", 0);
   } else {
     issue_stall_histogram_print_body("kernel_end", 0);
+    starvation_histogram_print_body("kernel_end", 0);
   }
   g_subcore_issue_debug_last_kernel_uid = 0;
   g_subcore_issue_debug_stats.reset(0, "");
@@ -435,6 +544,11 @@ void Subcore::print_issue_debug_summary() {
   {
     g_issue_stall_histogram.reset(0, "");
     g_issue_stall_histogram_last_kernel_uid = 0;
+  }
+#pragma omp critical(starvation_histogram)
+  {
+    g_starvation_histogram.reset(0, "");
+    g_starvation_histogram_last_kernel_uid = 0;
   }
 }
 
@@ -972,7 +1086,15 @@ void Subcore::issue(SM *shared_sm) {
           }
           issue_warp(shared_sm, m_ISSUE_CONTROL_latch, pI, active_mask, sm_warp_id, fu, is_fixed_latency_inst, use_traditional_scoreboarding, has_dst_regs, dst_type);
           is_issued_inst = true;
-          m_greedy_pointer_issue = subcore_warp_id;
+          if (m_config->is_subcore_round_robin_issue_scheduler) {
+            // Qi: true round-robin — advance to the next warp regardless of
+            // who just issued, instead of sticking to the same warp while it
+            // stays ready (the greedy-then-highest-id baseline below).
+            m_greedy_pointer_issue =
+                (subcore_warp_id + 1) % m_warps_of_subcore.size();
+          } else {
+            m_greedy_pointer_issue = subcore_warp_id;
+          }
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
           break;
         } else {
@@ -988,6 +1110,12 @@ void Subcore::issue(SM *shared_sm) {
                                          c_warp->get_kernel_info()->name(),
                                          op_type_to_string(pI->op), stall_reason,
                                          false);
+            // Qi: buffer this stall; classified starved/non-starved once
+            // this subcore's full warp scan for the cycle is done (below).
+            m_debug_stall_events_kernel_uid = c_warp->get_kernel_info()->get_uid();
+            m_debug_stall_events_kernel_name = c_warp->get_kernel_info()->name();
+            m_debug_stall_events_this_cycle.emplace_back(
+                op_type_to_string(pI->op), stall_reason);
           }
           if(!are_switch_warp_conditions_ready) {
             // has_been_possible_to_switch_warp = true;
@@ -1048,6 +1176,17 @@ void Subcore::issue(SM *shared_sm) {
     // m_stats->total_num_cycles_issue_stage_stall_at_least_one_warp_waiting_l1c += is_any_waiting_l1c;
   }
   shared_sm->m_sm_stats.m_stats_map["total_num_cycles_issue_stage_evaluated"]->increment_with_integer(1);
+
+  // Qi: now that is_issued_inst is final for this cycle, classify every
+  // stall buffered above as starved (no warp in this subcore issued
+  // anything) or not, then reset the buffer for next cycle.
+  if (m_config->subcore_issue_debug && !m_debug_stall_events_this_cycle.empty()) {
+    starvation_histogram_record_cycle(m_debug_stall_events_kernel_uid,
+                                      m_debug_stall_events_kernel_name,
+                                      m_debug_stall_events_this_cycle,
+                                      is_issued_inst);
+    m_debug_stall_events_this_cycle.clear();
+  }
 
   m_is_next_stage_of_issue_busy = !is_next_stage_availabe;
 }
