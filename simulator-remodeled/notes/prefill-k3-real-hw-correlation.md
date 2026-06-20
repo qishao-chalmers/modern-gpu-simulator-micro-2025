@@ -1169,6 +1169,17 @@ At SM0 `[commit_progress] committed_insts=100000`: baseline **99,844** cyc vs fu
 Full-chip L2-normal also raised `gpu_ipc` (5409 vs 4411 baseline); `gpu_occupancy` unchanged (~12.49%).
 Real H100 target remains **166,246** cycles — **~50k cycles (~30%) still open** after L2-normal.
 
+**L1D sectoring tested too — zero effect, closed without a full-chip run.** Switched `-gpgpu_cache:dl1` from
+`S:4:128:128,...` to `N:4:128:128,...` *on top of* the L2-normal config
+(`SM90_H100_l2norm_l1dnorm/gpgpusim.config`) and re-ran the 1-SM/1-CTA isolated test:
+`gpu_tot_sim_cycle = 191,627` — **byte-identical** to L2-normal-alone (0.00% delta, 0 incremental cycles).
+Confirms the prediction from the static op-mix (§3): `load_tiles_q8_0`'s loads all route through L1C (already
+`N` type, never sectored), so L1D sectoring was never on this kernel's critical load path; whatever `STG`
+output-write traffic (128 static instructions) exists doesn't generate enough sector-crossing miss traffic to
+matter, at least not within one CTA's window. Given the per-CTA effect is exactly zero, no full-chip run is
+needed — **L1D sectoring is closed out as a non-lever for k3.** (L1C, L1T, L1I, L0C were already confirmed `N`
+type earlier — §20/§22 — so L2 was the only sectored cache with a real effect on this kernel.)
+
 **L2-normal mem-trace read**: with normal L2, the §20.2 `dram_enter` +1/cycle/sector stepping pattern was **not
 observed**. Texture `dram_dur` is bimodal: **220 cyc** (~56%, likely L2-hit/short path) vs **243–272 cyc** (DRAM
 path). Adjacent 32B sectors at the same PC still show 243 vs 272 cyc (`pc=0xf350`), but without the sectored
