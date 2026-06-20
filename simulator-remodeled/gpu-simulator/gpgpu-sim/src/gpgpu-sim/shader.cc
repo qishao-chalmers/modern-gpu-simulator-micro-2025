@@ -83,6 +83,11 @@
 #include "remodeling/sm.h"
 #include "remodeling/new_stats.h"
 
+// Qi: isolation-experiment debug flag -- when >= 0, no SM other than this
+// one is ever bound to a CTA, so the kernel runs on exactly one SM with
+// zero inter-SM/inter-partition contention from the rest of the chip.
+int g_debug_isolate_sm_id = -1;
+
 
 #define PRIORITIZE_MSHR_OVER_WB 1
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -4564,6 +4569,13 @@ unsigned simt_core_cluster::issue_block2core() {
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned core =
         (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
+
+    // Qi: isolation experiment -- skip every SM except the chosen one, so
+    // it never even calls get_kernel()/set_kernel(), let alone issues a CTA.
+    if (g_debug_isolate_sm_id >= 0 &&
+        (int)m_core[core]->get_sid() != g_debug_isolate_sm_id) {
+      continue;
+    }
 
     kernel_info_t *kernel;
     // Jin: fetch kernel according to concurrent kernel setting

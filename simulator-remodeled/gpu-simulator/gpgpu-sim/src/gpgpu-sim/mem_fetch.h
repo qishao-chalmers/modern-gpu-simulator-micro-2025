@@ -50,6 +50,26 @@ enum mf_type {
 #undef MF_TUP
 #undef MF_TUP_END
 
+// Qi: per-stage mem_fetch latency mean/variance, split by whether the
+// request's PC falls in a configured "target" range (e.g. the divergence
+// segment found via [bar_arrival_trace]) vs everything else.
+// Enabled by -mem_fetch_stage_latency_debug 1.
+struct mem_fetch_stage_bucket {
+  unsigned long long count[NUM_MEM_REQ_STAT];
+  unsigned long long sum[NUM_MEM_REQ_STAT];
+  double sum_sq[NUM_MEM_REQ_STAT];
+};
+struct mem_fetch_stage_stats_t {
+  mem_fetch_stage_bucket target;  // pc in [pc_lo, pc_hi]
+  mem_fetch_stage_bucket other;
+};
+extern mem_fetch_stage_stats_t g_mem_fetch_stage_stats;
+extern bool g_mem_fetch_stage_latency_debug;
+extern unsigned long long g_mem_fetch_stage_latency_period;
+extern address_type g_mem_fetch_stage_latency_pc_lo;
+extern address_type g_mem_fetch_stage_latency_pc_hi;
+void mem_fetch_stage_stats_print_and_reset(unsigned long long cycle);
+
 class memory_config;
 class mem_fetch {
  public:
@@ -113,6 +133,18 @@ class mem_fetch {
   unsigned get_return_timestamp() const { return m_timestamp2; }
   unsigned get_icnt_receive_time() const { return m_icnt_receive_time; }
 
+  // Qi: per-request DRAM dwell time, for [mem_request_trace]. Set only if
+  // this request actually misses L2 and enters the DRAM subsystem (latency
+  // queue -> real bank/row-buffer timing model -> back to L2); requests that
+  // hit L2 never touch these, so m_dram_enter_cycle stays at the sentinel.
+  void set_dram_enter_cycle(unsigned long long t) { m_dram_enter_cycle = t; }
+  void set_dram_exit_cycle(unsigned long long t) { m_dram_exit_cycle = t; }
+  bool went_to_dram() const {
+    return m_dram_enter_cycle != (unsigned long long)-1;
+  }
+  unsigned long long get_dram_enter_cycle() const { return m_dram_enter_cycle; }
+  unsigned long long get_dram_exit_cycle() const { return m_dram_exit_cycle; }
+
   enum mem_access_type get_access_type() const { return m_access.get_type(); }
   const active_mask_t &get_access_warp_mask() const {
     return m_access.get_warp_mask();
@@ -126,7 +158,18 @@ class mem_fetch {
 
   addr_t get_access_address() const { return m_access.get_addr(); } // MOD. Added L0I
 
-  address_type get_pc() const { return m_inst.empty() ? -1 : m_inst.pc; }
+  // Qi: sector-split/internally-generated mem_fetch objects (see
+  // memory_sub_partition::push -> breakdown_request_to_sector_requests,
+  // l2cache.cc partition_mf_allocator::alloc) are constructed with inst=NULL,
+  // so m_inst is empty on them even though they originated from a real
+  // instruction. Fall back through the original_mf chain (set up precisely
+  // for this kind of request-splitting) so the PC survives past the L2
+  // partition boundary instead of reverting to -1.
+  address_type get_pc() const {
+    if (!m_inst.empty()) return m_inst.pc;
+    if (original_mf != NULL) return original_mf->get_pc();
+    return (address_type)-1;
+  }
   warp_inst_t &get_inst() { return m_inst; } // MOD. VPREG. Removed const
   enum mem_fetch_status get_status() const { return m_status; }
 
@@ -201,6 +244,11 @@ class mem_fetch {
                           // onto icnt to shader; only used for reads
   unsigned m_icnt_receive_time;  // set to gpu_sim_cycle + interconnect_latency
                                  // when fixed icnt latency mode is enabled
+
+  // Qi: per-request DRAM dwell time tracking, see set_dram_enter_cycle/
+  // set_dram_exit_cycle/went_to_dram above. Sentinel -1 = never entered DRAM.
+  unsigned long long m_dram_enter_cycle = (unsigned long long)-1;
+  unsigned long long m_dram_exit_cycle = (unsigned long long)-1;
 
   // requesting instruction (put last so mem_fetch prints nicer in gdb)
   warp_inst_t m_inst;

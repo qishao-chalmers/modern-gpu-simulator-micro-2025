@@ -768,6 +768,7 @@ class gpgpu_sim : public gpgpu_t {
   std::unique_ptr<grid_barrier_notify_info> register_grid_barrier_arrivement(mem_fetch *mf);
   void increase_num_threads_kernel(unsigned kernel_id, unsigned num_threads);
   void decrease_num_threads_kernel(unsigned kernel_id, unsigned num_threads);
+  void print_mem_partition_queue_snapshot();
   void cycle();
   bool active();
   bool cycle_insn_cta_max_hit() {

@@ -48,6 +48,127 @@
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
 
 
+namespace {
+
+bool is_sync_trace_instruction(const warp_inst_t *inst) {
+  return inst->is_any_kind_of_barrier() || inst->op == DEPBAR_OP ||
+         inst->op == LDGDEPBAR_OP;
+}
+
+void print_pending_pc_list(const char *label, const std::deque<new_addr_type> &pcs) {
+  printf("%s[", label);
+  bool first = true;
+  for (new_addr_type pc : pcs) {
+    if (!first) {
+      printf(",");
+    }
+    printf("0x%llx", (unsigned long long)pc);
+    first = false;
+  }
+  printf("]");
+}
+
+void print_sync_instruction_debug(SM *sm, const warp_inst_t *inst,
+                                  const char *stage) {
+  const shader_core_config *cfg = sm->get_config();
+  if (!cfg->subcore_issue_debug || sm->get_sid() != 0 ||
+      !is_sync_trace_instruction(inst)) {
+    return;
+  }
+
+  unsigned warp_id = inst->warp_id();
+  shd_warp_t *warp = sm->get_shd_warp(warp_id);
+  Dependency_State *dep = warp->get_dependency_state();
+  unsigned long long cycle =
+      sm->get_gpu()->gpu_tot_sim_cycle + sm->get_gpu()->gpu_sim_cycle;
+
+  int wait_barrier_mask_int = inst->get_extra_trace_instruction_info()
+                                  .get_control_bits()
+                                  .get_wait_barrier_bits();
+  std::bitset<6> wait_barrier_mask(wait_barrier_mask_int);
+
+  printf("[sync_%s_trace] sm=%u subcore=%u warp=%u dyn_warp=%u pc=0x%llx op=%s "
+         "cycle=%llu cta=%u\n",
+         stage, sm->get_sid(), inst->get_subcore_id(), warp_id,
+         warp->get_dynamic_warp_id(), (unsigned long long)inst->pc,
+         op_type_to_string(inst->op),
+         cycle, warp->get_cta_id());
+
+  if (inst->op == BARRIER_OP) {
+    printf("  bar.sync bar_id=%u bar_count=%u bar_type=%u at_prog_barrier=%u\n",
+           inst->bar_id, inst->bar_count, (unsigned)inst->bar_type,
+           (unsigned)sm->warp_waiting_at_barrier(warp_id));
+  } else if (inst->op == MEMORY_BARRIER_OP) {
+    printf("  membar membar_set=%u scoreboard_ready=%u wait_barriers_ready=%u\n",
+           (unsigned)warp->get_membar(),
+           (unsigned)(!sm->get_scoreboard()->pendingWrites(warp_id) &&
+                      !sm->get_scoreboard_WAR()->pendingReads(warp_id)),
+           (unsigned)sm->are_all_wait_barrier_ready(warp_id));
+  } else if (inst->op == LDGDEPBAR_OP) {
+    printf("  ldgdepbar pending_ldgsts=%u\n",
+           (unsigned)dep->are_ldgsts_pending());
+  }
+
+  printf("  wait_barrier_bits=0x%x inst_waits_on=",
+         wait_barrier_mask_int);
+  bool first_wait = true;
+  for (unsigned i = 0; i < cfg->num_wait_barriers_per_warp; i++) {
+    if (wait_barrier_mask[i]) {
+      if (!first_wait) {
+        printf(",");
+      }
+      printf("b%u(c=%u)", i, dep->get_wait_barrier_counter(i));
+      first_wait = false;
+    }
+  }
+  if (first_wait) {
+    printf("none");
+  }
+  printf("\n");
+
+  printf("  dep_counters=");
+  for (unsigned i = 0; i < cfg->num_wait_barriers_per_warp; i++) {
+    if (i > 0) {
+      printf(",");
+    }
+    printf("b%u:%u", i, dep->get_wait_barrier_counter(i));
+  }
+  printf("\n");
+
+  bool printed_outstanding = false;
+  for (unsigned i = 0; i < cfg->num_wait_barriers_per_warp; i++) {
+    const std::deque<new_addr_type> &pcs = dep->get_pending_mem_pcs(i);
+    if (!pcs.empty()) {
+      if (!printed_outstanding) {
+        printf("  outstanding_mem_pcs:");
+        printed_outstanding = true;
+      }
+      printf(" b%u=", i);
+      print_pending_pc_list("", pcs);
+    }
+  }
+  if (printed_outstanding) {
+    printf("\n");
+  }
+
+  if (dep->are_ldgsts_pending() || !dep->get_pending_ldgsts_pcs().empty()) {
+    printf("  pending_ldgsts=%u pcs=",
+           (unsigned)dep->are_ldgsts_pending());
+    print_pending_pc_list("", dep->get_pending_ldgsts_pcs());
+    printf("\n");
+  }
+
+  printf("  scoreboard_rd=%u scoreboard_wr=%u inst_in_pipe=%u yield=%u "
+         "stall_cnt=%u\n",
+         (unsigned)sm->get_scoreboard_WAR()->pendingReads(warp_id),
+         (unsigned)sm->get_scoreboard()->pendingWrites(warp_id),
+         warp->num_issued_inst_in_pipeline(),
+         (unsigned)!dep->is_yield_ready(), (unsigned)!dep->is_stall_counter_0());
+  fflush(stdout);
+}
+
+}  // namespace
+
 #define STRSIZE 1024
 
 unsigned int translate_warp_id_of_sm_to_subcore(unsigned int warp_id,
@@ -347,6 +468,7 @@ void SM::maybe_release_scoreboard_at_ex(warp_inst_t *instruction) {
 
 void SM::instruction_retirement(warp_inst_t *instruction) {
   unsigned int warp_id = instruction->warp_id();
+  print_sync_instruction_debug(this, instruction, "commit");
   // Qi: per-warp committed-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
   if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
     printf("[commit_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
@@ -380,7 +502,7 @@ void SM::instruction_retirement(warp_inst_t *instruction) {
       instruction->get_extra_trace_instruction_info().get_control_bits().get_id_new_write_barrier());       
     }
     if(instruction->m_is_ldgsts) {
-      m_physical_warp[warp_id]->get_dependency_state()->decrease_num_pending_ldgsts();
+      m_physical_warp[warp_id]->get_dependency_state()->decrease_num_pending_ldgsts(instruction->pc);
     }
   }
   m_physical_warp[warp_id]->dec_inst_in_pipeline();
@@ -413,6 +535,8 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   }
   
   func_exec_inst(*pipe_reg);
+
+  print_sync_instruction_debug(this, pipe_reg.get(), "issue");
 
   // Qi: per-warp issued-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
   if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
@@ -494,7 +618,7 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
     m_physical_warp[warp_id]->get_dependency_state()->set_stall_counter(
         stall_count);
     if( pipe_reg->m_is_ldgsts ) {
-      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts();
+      m_physical_warp[warp_id]->get_dependency_state()->increase_num_pending_ldgsts(pipe_reg->pc);
     }
   }
 

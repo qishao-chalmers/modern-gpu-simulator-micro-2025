@@ -38,7 +38,7 @@ Wait_Barrier::Wait_Barrier(unsigned int barrier_id){
     m_counter = 0;
 }
 
-unsigned int Wait_Barrier::get_counter(){
+unsigned int Wait_Barrier::get_counter() const{
     return m_counter;
 }
 
@@ -74,6 +74,7 @@ Dependency_State::Dependency_State(const shader_core_config* config, shader_core
     m_num_pending_ldgsts = 0;
     for(unsigned int i = 0; i < config->num_wait_barriers_per_warp; i++){
         m_wait_barriers.push_back(Wait_Barrier(i));
+        m_pending_mem_pcs.emplace_back();
     }
     m_stats = stats;
 }
@@ -85,6 +86,10 @@ void Dependency_State::reset() {
     for(auto &wait_barrier : m_wait_barriers){
         wait_barrier.reset();
     }
+    for(auto &pending_mem_pc : m_pending_mem_pcs) {
+        pending_mem_pc.clear();
+    }
+    m_pending_ldgsts_pcs.clear();
 }
 
 void Dependency_State::cycle() {
@@ -101,10 +106,17 @@ void Dependency_State::set_stall_counter(unsigned int stall_counter) {
 }
 
 void Dependency_State::action_over_wait_barrier(Wait_Barrier_Entry_Modifier *wait_barrier_entry_modifier) {
+    unsigned int barrier_id = wait_barrier_entry_modifier->barrier_id;
     if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::INCREASE_COUNTER){
-        m_wait_barriers[wait_barrier_entry_modifier->barrier_id].increase_counter();
+        m_wait_barriers[barrier_id].increase_counter();
+        if (wait_barrier_entry_modifier->pc != 0) {
+            m_pending_mem_pcs[barrier_id].push_back(wait_barrier_entry_modifier->pc);
+        }
     }else if(wait_barrier_entry_modifier->barrier_action == Wait_Barrier_Action::DECREASE_COUNTER){
-        m_wait_barriers[wait_barrier_entry_modifier->barrier_id].decrease_counter();
+        m_wait_barriers[barrier_id].decrease_counter();
+        if (!m_pending_mem_pcs[barrier_id].empty()) {
+            m_pending_mem_pcs[barrier_id].pop_front();
+        }
     }else{
         std::cout << "Error: Wait barrier action not recognized" << std::endl;
         abort();
@@ -128,15 +140,34 @@ bool Dependency_State::are_wait_barriers_ready(std::vector<Wait_Barrier_Checking
     return true;
 }
 
-void Dependency_State::increase_num_pending_ldgsts() {
+void Dependency_State::increase_num_pending_ldgsts(new_addr_type pc) {
     m_num_pending_ldgsts++;
+    if (pc != 0) {
+        m_pending_ldgsts_pcs.push_back(pc);
+    }
 }
-void Dependency_State::decrease_num_pending_ldgsts() {
+void Dependency_State::decrease_num_pending_ldgsts(new_addr_type pc) {
+    (void)pc;
     assert(m_num_pending_ldgsts > 0);
     m_num_pending_ldgsts--;
+    if (!m_pending_ldgsts_pcs.empty()) {
+        m_pending_ldgsts_pcs.pop_front();
+    }
 }
 bool Dependency_State::are_ldgsts_pending() {
     return m_num_pending_ldgsts != 0;
+}
+
+unsigned int Dependency_State::get_wait_barrier_counter(unsigned barrier_id) const {
+    return m_wait_barriers[barrier_id].get_counter();
+}
+
+const std::deque<new_addr_type> &Dependency_State::get_pending_mem_pcs(unsigned barrier_id) const {
+    return m_pending_mem_pcs[barrier_id];
+}
+
+const std::deque<new_addr_type> &Dependency_State::get_pending_ldgsts_pcs() const {
+    return m_pending_ldgsts_pcs;
 }
 
 bool Dependency_State::are_pending_dependencies() {

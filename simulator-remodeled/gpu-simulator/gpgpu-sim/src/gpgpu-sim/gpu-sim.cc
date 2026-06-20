@@ -1374,6 +1374,60 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                           "Stop simulation after this gpu_sim cycle and print stall "
                           "summary (0=disabled; use with k3-only filter)",
                           "0");
+  // Qi: isolation experiment -- skip binding/issuing CTAs to every SM except this one
+  extern int g_debug_isolate_sm_id;
+  option_parser_register(opp, "-debug_isolate_sm_id", OPT_INT32,
+                          &g_debug_isolate_sm_id,
+                          "If >= 0, no SM other than this one is ever bound to a CTA "
+                          "(isolates the kernel to one SM, zero inter-SM contention). "
+                          "-1 = disabled (default)",
+                          "-1");
+  // Qi: per-stage mem_fetch latency mean/variance, split by request PC vs a target PC range
+  option_parser_register(opp, "-mem_fetch_stage_latency_debug", OPT_BOOL,
+                          &g_mem_fetch_stage_latency_debug,
+                          "Track mean/variance of time spent in each mem_fetch_status stage, "
+                          "split into a target-PC-range bucket and an everything-else bucket "
+                          "(default=0)",
+                          "0");
+  option_parser_register(opp, "-mem_fetch_stage_latency_period", OPT_UINT64,
+                          &g_mem_fetch_stage_latency_period,
+                          "Print and reset the per-stage mem_fetch stats every N gpu_sim cycles "
+                          "(default=10000)",
+                          "10000");
+  option_parser_register(opp, "-mem_fetch_stage_latency_pc_lo", OPT_UINT64,
+                          &g_mem_fetch_stage_latency_pc_lo,
+                          "Lower bound (inclusive) of the target PC range for "
+                          "-mem_fetch_stage_latency_debug",
+                          "0");
+  option_parser_register(opp, "-mem_fetch_stage_latency_pc_hi", OPT_UINT64,
+                          &g_mem_fetch_stage_latency_pc_hi,
+                          "Upper bound (inclusive) of the target PC range for "
+                          "-mem_fetch_stage_latency_debug (0=feature inert, no requests bucketed as target)",
+                          "0");
+  // Qi: per-partition L2-to-DRAM queue depth snapshot, to check for transient hotspotting
+  extern bool g_mem_partition_queue_snapshot_debug;
+  extern unsigned long long g_mem_partition_queue_snapshot_period;
+  option_parser_register(opp, "-mem_partition_queue_snapshot_debug", OPT_BOOL,
+                          &g_mem_partition_queue_snapshot_debug,
+                          "Print instantaneous L2-to-DRAM queue depth for every memory partition "
+                          "every N gpu_sim cycles (default=0)",
+                          "0");
+  option_parser_register(opp, "-mem_partition_queue_snapshot_period", OPT_UINT64,
+                          &g_mem_partition_queue_snapshot_period,
+                          "Period (gpu_sim cycles) for -mem_partition_queue_snapshot_debug",
+                          "10000");
+  // Qi: per-request send/response/duration trace (warp, pc, addr, type, timing)
+  extern bool g_mem_request_trace_debug;
+  extern int g_mem_request_trace_sm_id;
+  option_parser_register(opp, "-mem_request_trace_debug", OPT_BOOL,
+                          &g_mem_request_trace_debug,
+                          "Print [mem_request_trace] line for every memory response "
+                          "delivered to the target SM: warp, pc, addr, type, send/resp/dur cycles",
+                          "0");
+  option_parser_register(opp, "-mem_request_trace_sm_id", OPT_INT32,
+                          &g_mem_request_trace_sm_id,
+                          "Target SM id for -mem_request_trace_debug (default=0)",
+                          "0");
   // MOD. Begin. InterWarp coalescing
   option_parser_register(opp, "-measure_coalescing_potential_stats", OPT_BOOL,
     &measure_coalescing_potential_stats,
@@ -2877,6 +2931,39 @@ void gpgpu_sim::decrease_num_threads_kernel(unsigned kernel_id, unsigned num_thr
   m_grid_barrier_status[kernel_id].num_threads_kernel -= num_threads;
 }
 
+// Qi: instantaneous per-partition L2-to-DRAM queue depth snapshot, to test
+// whether the chronic backlog found in mem_stage_stats (notes §16.4) is
+// transient hotspotting at a subset of the 80 partitions vs. uniform load.
+bool g_mem_partition_queue_snapshot_debug = false;
+unsigned long long g_mem_partition_queue_snapshot_period = 10000;
+
+// Qi: per-request send/response/duration trace, gated to one SM
+bool g_mem_request_trace_debug = false;
+int g_mem_request_trace_sm_id = 0;
+
+void gpgpu_sim::print_mem_partition_queue_snapshot() {
+  unsigned n = m_memory_config->m_n_mem;
+  unsigned min_len = (unsigned)-1, max_len = 0;
+  unsigned long long sum = 0;
+  std::vector<unsigned> lens(n);
+  for (unsigned i = 0; i < n; i++) {
+    unsigned len = m_memory_sub_partition[i]->L2_dram_queue_length();
+    lens[i] = len;
+    sum += len;
+    if (len < min_len) min_len = len;
+    if (len > max_len) max_len = len;
+  }
+  double mean = (double)sum / n;
+  double sumsq = 0;
+  for (unsigned i = 0; i < n; i++) sumsq += (lens[i] - mean) * (lens[i] - mean);
+  double stdev = sqrt(sumsq / n);
+  printf("[mem_partition_queue_snapshot] cycle=%llu n_partitions=%u min=%u max=%u mean=%.2f stdev=%.2f | per_partition:",
+         gpu_tot_sim_cycle + gpu_sim_cycle, n, min_len, max_len, mean, stdev);
+  for (unsigned i = 0; i < n; i++) printf(" %u", lens[i]);
+  printf("\n");
+  fflush(stdout);
+}
+
 
 void gpgpu_sim::cycle() {
   m_active_sms_this_cycle = 0;
@@ -2936,6 +3023,34 @@ void gpgpu_sim::cycle() {
           // if (!mf->get_is_write())
           mf->set_return_timestamp(gpu_sim_cycle + gpu_tot_sim_cycle);
           mf->set_status(IN_ICNT_TO_SHADER, gpu_sim_cycle + gpu_tot_sim_cycle);
+          // Qi: per-request send/response/duration trace, gated to one SM so
+          // volume stays readable -- exactly the warp/PC/addr/timing fields
+          // needed to see the gap directly, request by request.
+          if (g_mem_request_trace_debug &&
+              (int)mf->get_sid() == g_mem_request_trace_sm_id) {
+            unsigned long long send_t = mf->get_timestamp();
+            unsigned long long resp_t = gpu_sim_cycle + gpu_tot_sim_cycle;
+            if (mf->went_to_dram()) {
+              printf(
+                  "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
+                  "send=%llu resp=%llu dur=%llu dram=1 dram_enter=%llu "
+                  "dram_exit=%llu dram_dur=%llu\n",
+                  mf->get_wid(), (unsigned long long)mf->get_pc(),
+                  (unsigned long long)mf->get_addr(),
+                  mem_access_type_str(mf->get_access_type()), send_t, resp_t,
+                  resp_t - send_t, mf->get_dram_enter_cycle(),
+                  mf->get_dram_exit_cycle(),
+                  mf->get_dram_exit_cycle() - mf->get_dram_enter_cycle());
+            } else {
+              printf(
+                  "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
+                  "send=%llu resp=%llu dur=%llu dram=0\n",
+                  mf->get_wid(), (unsigned long long)mf->get_pc(),
+                  (unsigned long long)mf->get_addr(),
+                  mem_access_type_str(mf->get_access_type()), send_t, resp_t,
+                  resp_t - send_t);
+            }
+          }
           ::icnt_push(m_shader_config->mem2device(i), mf->get_tpc(), mf,
                       response_size, 0);
           m_memory_sub_partition[i]->pop();
@@ -3075,6 +3190,18 @@ void gpgpu_sim::cycle() {
         raise(SIGTRAP);  // Debug breakpoint
       }
       gpu_sim_cycle++;
+
+      // Qi: periodic per-stage mem_fetch latency mean/variance dump
+      if (g_mem_fetch_stage_latency_debug && g_mem_fetch_stage_latency_period > 0 &&
+          (gpu_sim_cycle % g_mem_fetch_stage_latency_period) == 0) {
+        mem_fetch_stage_stats_print_and_reset(gpu_tot_sim_cycle + gpu_sim_cycle);
+      }
+
+      // Qi: periodic per-partition L2-to-DRAM queue depth snapshot
+      if (g_mem_partition_queue_snapshot_debug && g_mem_partition_queue_snapshot_period > 0 &&
+          (gpu_sim_cycle % g_mem_partition_queue_snapshot_period) == 0) {
+        print_mem_partition_queue_snapshot();
+      }
 
       if (g_interactive_debugger_enabled) {
         gpgpu_debug();

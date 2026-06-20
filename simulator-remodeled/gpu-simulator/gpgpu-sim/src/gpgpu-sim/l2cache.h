@@ -187,6 +187,8 @@ class memory_sub_partition {
   bool L2_dram_queue_empty() const;
   class mem_fetch *L2_dram_queue_top() const;
   void L2_dram_queue_pop();
+  // Qi: instantaneous queue depth, for per-partition hotspotting snapshots
+  unsigned L2_dram_queue_length() const { return m_L2_dram_queue->get_length(); }
 
   // interface to dram_L2_queue
   bool dram_L2_queue_full() const;

@@ -1125,22 +1125,30 @@ void baseline_cache::cycle() {
 /// in caller)
 bool baseline_cache::fill(mem_fetch *mf, unsigned time) { // MOD. Added L0I
   bool res_deleted = false; // MOD. Added L0I
-  if (m_config.m_mshr_type == SECTOR_ASSOC) {
-    assert(mf->get_original_mf());
-    extra_mf_fields_lookup::iterator e =
-        m_extra_mf_fields.find(mf->get_original_mf());
-    assert(e != m_extra_mf_fields.end());
-    e->second.pending_read--;
+  if (m_config.m_mshr_type == SECTOR_ASSOC && mf->get_original_mf() != nullptr) {
+    mem_fetch *parent = mf->get_original_mf();
+    extra_mf_fields_lookup::iterator e = m_extra_mf_fields.find(parent);
+    if (e != m_extra_mf_fields.end() && parent != mf) {
+      // Sector sub-fill from a sectored downstream cache (e.g. sector L2).
+      e->second.pending_read--;
 
-    if ( (e->second.pending_read > 0) && !mf->get_is_filling_L0()) { // MOD. Added L0I
-      // wait for the other requests to come back
-      delete mf;
-      return res_deleted; // MOD. Added L0I
+      if ((e->second.pending_read > 0) && !mf->get_is_filling_L0()) { // MOD. Added L0I
+        // wait for the other requests to come back
+        delete mf;
+        return res_deleted; // MOD. Added L0I
+      } else {
+        mem_fetch *temp = mf;
+        mf = parent;
+        delete temp;
+        res_deleted = true; // MOD. Added L0I
+      }
+    } else if (m_extra_mf_fields.find(mf) != m_extra_mf_fields.end()) {
+      // Non-sector downstream (e.g. NORMAL L2) returned the tracked miss in
+      // one response. get_original_mf() may point at an outer L0_icnt wrapper
+      // that is not keyed in this cache's m_extra_mf_fields — fall through.
     } else {
-      mem_fetch *temp = mf;
-      mf = mf->get_original_mf();
-      delete temp;
-      res_deleted = true; // MOD. Added L0I
+      // Last resort: treat parent as the tracked miss (legacy single-fill path).
+      mf = parent;
     }
   }
 
@@ -1225,6 +1233,20 @@ bool baseline_cache::send_read_request(new_addr_type addr,
   bool mshr_hit = m_mshrs.probe(mshr_addr);
   bool mshr_avail = !m_mshrs.full(mshr_addr);
   bool erase_mf = false;
+  // Qi: debug why two same-line, different-offset coalesced sub-accesses
+  // didn't merge in the MSHR -- reuses the [mem_request_trace] gate.
+  extern bool g_mem_request_trace_debug;
+  extern int g_mem_request_trace_sm_id;
+  if (g_mem_request_trace_debug &&
+      (int)mf->get_sid() == g_mem_request_trace_sm_id) {
+    printf(
+        "[mshr_probe_trace] warp=%u pc=0x%llx addr=0x%llx mshr_addr=0x%llx "
+        "block_addr=0x%llx mshr_hit=%d mshr_avail=%d cache=%s time=%u\n",
+        mf->get_wid(), (unsigned long long)mf->get_pc(),
+        (unsigned long long)mf->get_addr(), (unsigned long long)mshr_addr,
+        (unsigned long long)block_addr, (int)mshr_hit, (int)mshr_avail,
+        m_name.c_str(), time);
+  }
   if (mshr_hit && mshr_avail) {
     if (read_only)
       m_tag_array->access(block_addr, time, cache_index, mf);
@@ -1998,21 +2020,26 @@ void tex_cache::cycle() {
 
 /// Place returning cache block into reorder buffer
 void tex_cache::fill(mem_fetch *mf, unsigned time) {
-  if (m_config.m_mshr_type == SECTOR_TEX_FIFO) {
-    assert(mf->get_original_mf());
-    extra_mf_fields_lookup::iterator e =
-        m_extra_mf_fields.find(mf->get_original_mf());
-    assert(e != m_extra_mf_fields.end());
-    e->second.pending_read--;
+  if (m_config.m_mshr_type == SECTOR_TEX_FIFO &&
+      mf->get_original_mf() != nullptr) {
+    mem_fetch *parent = mf->get_original_mf();
+    extra_mf_fields_lookup::iterator e = m_extra_mf_fields.find(parent);
+    if (e != m_extra_mf_fields.end() && parent != mf) {
+      e->second.pending_read--;
 
-    if (e->second.pending_read > 0) {
-      // wait for the other requests to come back
-      delete mf;
-      return;
+      if (e->second.pending_read > 0) {
+        // wait for the other requests to come back
+        delete mf;
+        return;
+      } else {
+        mem_fetch *temp = mf;
+        mf = parent;
+        delete temp;
+      }
+    } else if (m_extra_mf_fields.find(mf) != m_extra_mf_fields.end()) {
+      // Non-sector downstream returned the tracked miss directly.
     } else {
-      mem_fetch *temp = mf;
-      mf = mf->get_original_mf();
-      delete temp;
+      mf = parent;
     }
   }
 

@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <deque>
 #include <vector>
 #include <cstdio>
 
@@ -80,7 +81,7 @@ class Wait_Barrier {
         void reset();
         void decrease_counter();
         void increase_counter();
-        unsigned int get_counter();
+        unsigned int get_counter() const;
         unsigned int get_barrier_id();
 
         void print_state(FILE *out);
@@ -107,11 +108,15 @@ class Dependency_State {
         bool is_stall_counter_0();
         bool are_wait_barriers_ready(std::vector<Wait_Barrier_Checking> wait_barriers_checking);
         
-        void increase_num_pending_ldgsts();
-        void decrease_num_pending_ldgsts();
+        void increase_num_pending_ldgsts(new_addr_type pc = 0);
+        void decrease_num_pending_ldgsts(new_addr_type pc = 0);
         bool are_ldgsts_pending();
 
         bool are_pending_dependencies();
+
+        unsigned int get_wait_barrier_counter(unsigned barrier_id) const;
+        const std::deque<new_addr_type> &get_pending_mem_pcs(unsigned barrier_id) const;
+        const std::deque<new_addr_type> &get_pending_ldgsts_pcs() const;
 
         void print_state(FILE *out);
 
@@ -120,6 +125,8 @@ class Dependency_State {
         unsigned int m_stall_counter;
         unsigned int m_num_pending_ldgsts;
         std::vector<Wait_Barrier> m_wait_barriers;//{0,1,2,3,4,5};
+        std::vector<std::deque<new_addr_type>> m_pending_mem_pcs;
+        std::deque<new_addr_type> m_pending_ldgsts_pcs;
         shader_core_stats* m_stats;
 };
 

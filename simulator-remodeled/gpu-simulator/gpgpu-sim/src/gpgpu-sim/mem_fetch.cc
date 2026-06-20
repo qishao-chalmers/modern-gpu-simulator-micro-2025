@@ -31,8 +31,17 @@
 #include "mem_latency_stat.h"
 #include "shader.h"
 #include "visualizer.h"
+#include <cmath>
+#include <algorithm>
 
 unsigned mem_fetch::sm_next_mf_request_uid = 1;
+
+// Qi: per-stage mem_fetch latency mean/variance instrumentation (see mem_fetch.h)
+mem_fetch_stage_stats_t g_mem_fetch_stage_stats;
+bool g_mem_fetch_stage_latency_debug = false;
+unsigned long long g_mem_fetch_stage_latency_period = 10000;
+address_type g_mem_fetch_stage_latency_pc_lo = 0;
+address_type g_mem_fetch_stage_latency_pc_hi = 0;
 
 mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
                      unsigned ctrl_size, unsigned wid, unsigned sid,
@@ -114,8 +123,47 @@ void mem_fetch::print(FILE *fp, bool print_inst) const {
 
 void mem_fetch::set_status(enum mem_fetch_status status,
                            unsigned long long cycle) {
+  // Qi: record how long this request just spent in the OLD status before
+  // overwriting it, bucketed by whether its PC is in the configured target
+  // range (-mem_fetch_stage_latency_pc_lo/_hi).
+  if (g_mem_fetch_stage_latency_debug && (unsigned)m_status < NUM_MEM_REQ_STAT &&
+      cycle >= m_status_change) {
+    unsigned long long duration = cycle - m_status_change;
+    address_type pc = get_pc();
+    bool in_target = (g_mem_fetch_stage_latency_pc_hi > 0) &&
+                      (pc >= g_mem_fetch_stage_latency_pc_lo) &&
+                      (pc <= g_mem_fetch_stage_latency_pc_hi);
+    mem_fetch_stage_bucket &b =
+        in_target ? g_mem_fetch_stage_stats.target : g_mem_fetch_stage_stats.other;
+    b.count[m_status]++;
+    b.sum[m_status] += duration;
+    b.sum_sq[m_status] += (double)duration * (double)duration;
+  }
   m_status = status;
   m_status_change = cycle;
+}
+
+static void print_mem_fetch_stage_bucket(const char *label,
+                                         const mem_fetch_stage_bucket &b) {
+  for (unsigned s = 0; s < NUM_MEM_REQ_STAT; s++) {
+    if (b.count[s] == 0) continue;
+    double n = (double)b.count[s];
+    double mean = (double)b.sum[s] / n;
+    double var = b.sum_sq[s] / n - mean * mean;
+    if (var < 0.0) var = 0.0;
+    printf("[mem_stage_stats] %-7s %-32s n=%-10llu mean=%-10.2f var=%-12.2f stdev=%-8.2f\n",
+           label, Status_str[s], b.count[s], mean, var, std::sqrt(var));
+  }
+}
+
+void mem_fetch_stage_stats_print_and_reset(unsigned long long cycle) {
+  printf("[mem_stage_stats] ==== cycle=%llu pc_range=[0x%llx,0x%llx] ====\n", cycle,
+         (unsigned long long)g_mem_fetch_stage_latency_pc_lo,
+         (unsigned long long)g_mem_fetch_stage_latency_pc_hi);
+  print_mem_fetch_stage_bucket("target", g_mem_fetch_stage_stats.target);
+  print_mem_fetch_stage_bucket("other", g_mem_fetch_stage_stats.other);
+  fflush(stdout);
+  memset(&g_mem_fetch_stage_stats, 0, sizeof(g_mem_fetch_stage_stats));
 }
 
 bool mem_fetch::isatomic() const {

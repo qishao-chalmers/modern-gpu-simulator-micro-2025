@@ -256,6 +256,8 @@ void memory_partition_unit::simple_dram_model_cycle() {
           mf_return->set_status(
               IN_PARTITION_DRAM_TO_L2_QUEUE,
               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+          mf_return->set_dram_exit_cycle(m_gpu->gpu_sim_cycle +
+                                         m_gpu->gpu_tot_sim_cycle);
           m_arbitration_metadata.return_credit(dest_spid);
           MEMPART_DPRINTF(
               "mem_fetch request %p return from dram to sub partition %d\n",
@@ -296,6 +298,7 @@ void memory_partition_unit::simple_dram_model_cycle() {
       m_dram_latency_queue.push_back(d);
       mf->set_status(IN_PARTITION_DRAM_LATENCY_QUEUE,
                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+      mf->set_dram_enter_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       m_arbitration_metadata.borrow_credit(spid);
       break;  // the DRAM should only accept one request per cycle
     }
@@ -319,6 +322,8 @@ void memory_partition_unit::dram_cycle() {
         m_sub_partition[dest_spid]->dram_L2_queue_push(mf_return);
         mf_return->set_status(IN_PARTITION_DRAM_TO_L2_QUEUE,
                               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        mf_return->set_dram_exit_cycle(m_gpu->gpu_sim_cycle +
+                                       m_gpu->gpu_tot_sim_cycle);
         m_arbitration_metadata.return_credit(dest_spid);
         MEMPART_DPRINTF(
             "mem_fetch request %p return from dram to sub partition %d\n",
@@ -358,6 +363,7 @@ void memory_partition_unit::dram_cycle() {
       m_dram_latency_queue.push_back(d);
       mf->set_status(IN_PARTITION_DRAM_LATENCY_QUEUE,
                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+      mf->set_dram_enter_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       m_arbitration_metadata.borrow_credit(spid);
       break;  // the DRAM should only accept one request per cycle
     }
