@@ -1672,6 +1672,8 @@ class warp_inst_t : public inst_t {
   new_addr_type get_memreqaddr(unsigned int thread_id, unsigned int pos_id) const { return m_per_scalar_thread[thread_id].memreqaddr[pos_id]; }
   new_addr_type get_memreqaddr_memref2(unsigned int thread_id, unsigned int pos_id) const { return m_per_scalar_thread_memref2[thread_id].memreqaddr[pos_id]; }
 
+  unsigned long long get_issue_cycle() const { return issue_cycle; }
+
  protected:
   unsigned m_uid;
   unsigned long long m_unique_inst_id;

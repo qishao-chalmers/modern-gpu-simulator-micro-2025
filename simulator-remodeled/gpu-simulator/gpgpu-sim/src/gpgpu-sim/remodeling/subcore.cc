@@ -101,6 +101,32 @@ struct IssueStallHistogramState {
 IssueStallHistogramState g_issue_stall_histogram;
 unsigned g_issue_stall_histogram_last_kernel_uid = 0;
 
+// Qi: per-PC stall attribution (-subcore_issue_debug 1). Same idea as
+// IssueStallHistogramState but keyed by PC instead of op-type, so a single
+// op-type+reason bucket (e.g. "SP_OP/scoreboard") can be split apart into the
+// individual static instructions actually responsible -- needed because that
+// bucket turned out to be a mix of unrelated code (FFMA dequant chain vs
+// IMAD.WIDE address-recomputation chain, see notes §23.22/§23.22b).
+struct PcStallHistogramState {
+  unsigned kernel_uid = 0;
+  std::string kernel_name;
+  std::unordered_map<unsigned, std::unordered_map<std::string, unsigned long long>>
+      stall_by_pc_reason;
+  std::unordered_map<unsigned, unsigned long long> issued_by_pc;
+  std::unordered_map<unsigned, std::string> op_by_pc;
+
+  void reset(unsigned uid, const std::string &name) {
+    stall_by_pc_reason.clear();
+    issued_by_pc.clear();
+    op_by_pc.clear();
+    kernel_uid = uid;
+    kernel_name = name;
+  }
+};
+
+PcStallHistogramState g_pc_stall_histogram;
+unsigned g_pc_stall_histogram_last_kernel_uid = 0;
+
 // Qi: starvation cross-check. For every (op, reason) stall event already
 // counted in g_issue_stall_histogram, additionally tracks how many of those
 // events happened on a cycle where the *whole subcore* issued nothing at
@@ -438,6 +464,86 @@ void issue_stall_histogram_print_body(const char *tag,
   std::cout.flush();
 }
 
+// Qi: per-PC stall attribution (-subcore_issue_debug 1) -- see PcStallHistogramState above.
+void pc_stall_histogram_record(unsigned kernel_uid, const std::string &kernel_name,
+                               unsigned pc, const char *op, const char *reason,
+                               bool issued) {
+#pragma omp critical(pc_stall_histogram)
+  {
+    if (g_pc_stall_histogram_last_kernel_uid != kernel_uid) {
+      g_pc_stall_histogram.reset(kernel_uid, kernel_name);
+      g_pc_stall_histogram_last_kernel_uid = kernel_uid;
+    }
+    g_pc_stall_histogram.op_by_pc[pc] = op;
+    if (issued) {
+      g_pc_stall_histogram.issued_by_pc[pc]++;
+    } else {
+      g_pc_stall_histogram.stall_by_pc_reason[pc][reason]++;
+    }
+  }
+}
+
+void pc_stall_histogram_print_body(const char *tag, unsigned long long gpu_cycle) {
+  PcStallHistogramState snapshot;
+  bool has_data = false;
+#pragma omp critical(pc_stall_histogram)
+  {
+    if (!g_pc_stall_histogram.stall_by_pc_reason.empty()) {
+      snapshot = g_pc_stall_histogram;
+      has_data = true;
+    }
+  }
+  if (!has_data) {
+    return;
+  }
+
+  struct Row {
+    unsigned pc;
+    std::string op;
+    unsigned long long stall_total;
+    unsigned long long issued_total;
+    std::vector<std::pair<std::string, unsigned long long>> reasons;
+  };
+  std::vector<Row> rows;
+  for (const auto &pc_entry : snapshot.stall_by_pc_reason) {
+    Row r;
+    r.pc = pc_entry.first;
+    auto op_it = snapshot.op_by_pc.find(pc_entry.first);
+    r.op = (op_it != snapshot.op_by_pc.end()) ? op_it->second : "?";
+    r.stall_total = 0;
+    for (const auto &reason_entry : pc_entry.second) {
+      r.stall_total += reason_entry.second;
+      r.reasons.emplace_back(reason_entry.first, reason_entry.second);
+    }
+    auto issued_it = snapshot.issued_by_pc.find(pc_entry.first);
+    r.issued_total = (issued_it != snapshot.issued_by_pc.end()) ? issued_it->second : 0;
+    std::sort(r.reasons.begin(), r.reasons.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    rows.push_back(std::move(r));
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+    return a.stall_total > b.stall_total;
+  });
+
+  std::cout << "[pc_stall_stats] " << tag << " gpu_cycle=" << gpu_cycle
+            << " kernel uid=" << snapshot.kernel_uid
+            << " name=" << snapshot.kernel_name
+            << " (all SMs, per static PC at IBuffer head, top 60 by stall count)\n";
+  const unsigned top_n = std::min<unsigned>(60, rows.size());
+  for (unsigned i = 0; i < top_n; i++) {
+    const Row &r = rows[i];
+    std::cout << "  pc=0x" << std::hex << r.pc << std::dec << " op=" << r.op
+              << " stall=" << r.stall_total << " issued=" << r.issued_total
+              << " reasons=[";
+    for (size_t j = 0; j < r.reasons.size(); j++) {
+      if (j) std::cout << ",";
+      std::cout << r.reasons[j].first << ":" << r.reasons[j].second;
+    }
+    std::cout << "]\n";
+  }
+  std::cout.flush();
+}
+
 void issue_debug_print_summary_body(const char *tag,
                                     unsigned long long gpu_cycle) {
   const SubcoreIssueDebugStats &s = g_subcore_issue_debug_stats;
@@ -475,6 +581,7 @@ void issue_debug_print_summary_body(const char *tag,
   }
   issue_stall_histogram_print_body(tag, gpu_cycle);
   starvation_histogram_print_body(tag, gpu_cycle);
+  pc_stall_histogram_print_body(tag, gpu_cycle);
 }
 
 void issue_debug_maybe_periodic_summary(const shader_core_config *config,
@@ -535,6 +642,7 @@ void Subcore::print_issue_debug_summary() {
   } else {
     issue_stall_histogram_print_body("kernel_end", 0);
     starvation_histogram_print_body("kernel_end", 0);
+    pc_stall_histogram_print_body("kernel_end", 0);
   }
   g_subcore_issue_debug_last_kernel_uid = 0;
   g_subcore_issue_debug_stats.reset(0, "");
@@ -549,6 +657,11 @@ void Subcore::print_issue_debug_summary() {
   {
     g_starvation_histogram.reset(0, "");
     g_starvation_histogram_last_kernel_uid = 0;
+  }
+#pragma omp critical(pc_stall_histogram)
+  {
+    g_pc_stall_histogram.reset(0, "");
+    g_pc_stall_histogram_last_kernel_uid = 0;
   }
 }
 
@@ -612,7 +725,12 @@ void Subcore::cycle() {
     issue(m_sm);
     decode(m_sm);
     fetch(m_sm);
-    m_greedy_pointer_fetch = m_greedy_pointer_issue;
+    // Qi: baseline re-syncs fetch priority to whoever currently has issue
+    // priority every cycle -- when decoupled (-is_subcore_fetch_round_robin_independent),
+    // fetch() above already advanced m_greedy_pointer_fetch on its own.
+    if (!m_config->is_subcore_fetch_round_robin_independent) {
+      m_greedy_pointer_fetch = m_greedy_pointer_issue;
+    }
   }
   // if(m_sm->get_sid() == 0 && m_subcore_id == 0 && m_sm->get_current_gpu_cycle() == 3837) {
   //   fflush(stdout);
@@ -903,7 +1021,18 @@ void Subcore::issue(SM *shared_sm) {
         bool is_not_yield = true;
         
         if(use_traditional_scoreboarding) {
-          are_traditional_scoreaboards_ready = !(shared_sm->get_scoreboard()->checkCollision_remodeling(sm_warp_id, pI) || shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
+          if (m_config->is_register_bypass_forwarding_enabled) {
+            unsigned long long cur_cycle_for_bypass =
+                shared_sm->get_gpu()->gpu_tot_sim_cycle + shared_sm->get_gpu()->gpu_sim_cycle;
+            are_traditional_scoreaboards_ready =
+                !(shared_sm->get_scoreboard()->checkCollision_remodeling_with_bypass(
+                      sm_warp_id, pI, m_subcore_id, cur_cycle_for_bypass,
+                      (unsigned int)m_config->register_bypass_window_cycles,
+                      (unsigned int)m_config->register_bypass_ports_per_subcore) ||
+                  shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
+          } else {
+            are_traditional_scoreaboards_ready = !(shared_sm->get_scoreboard()->checkCollision_remodeling(sm_warp_id, pI) || shared_sm->get_scoreboard_WAR()->checkCollision_remodeling(sm_warp_id, pI));
+          }
         }else {
           is_stall_counter_0 =
             c_warp->get_dependency_state()->is_stall_counter_0();
@@ -1071,6 +1200,18 @@ void Subcore::issue(SM *shared_sm) {
                                          c_warp->get_kernel_info()->name(),
                                          op_type_to_string(pI->op), "ready",
                                          true);
+            pc_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
+                                      c_warp->get_kernel_info()->name(), pI->pc,
+                                      op_type_to_string(pI->op), "ready", true);
+          }
+          // Qi: live per-cycle issue-wait trace (-issue_wait_trace_debug 1), SM0 only
+          if (m_config->issue_wait_trace_debug && m_sm->get_sid() == 0) {
+            gpgpu_sim *gpu = shared_sm->get_gpu();
+            printf("[issue_wait_trace] sm=%u subcore=%u warp=%u dyn_warp=%u pc=0x%x op=%s "
+                   "cycle=%llu issued=1 reason=ready\n",
+                   m_sm->get_sid(), m_subcore_id, sm_warp_id,
+                   c_warp->get_dynamic_warp_id(), pI->pc, op_type_to_string(pI->op),
+                   gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle);
           }
           if (m_config->subcore_issue_debug && m_sm->get_sid() == 0 &&
               m_subcore_id == 0 && c_warp->get_dynamic_warp_id() == 0) {
@@ -1098,7 +1239,9 @@ void Subcore::issue(SM *shared_sm) {
           m_num_pending_cycles_constant_cache_misses_before_switch_to_other_warp = m_config->num_const_cache_cycle_misses_before_switch_to_other_warp;
           break;
         } else {
-          if (m_config->subcore_issue_debug) {
+          bool is_issue_wait_trace_active =
+              m_config->issue_wait_trace_debug && m_sm->get_sid() == 0;
+          if (m_config->subcore_issue_debug || is_issue_wait_trace_active) {
             const char *stall_reason = issue_stall_primary_reason(
                 shared_sm, c_warp, sm_warp_id, are_switch_warp_conditions_ready,
                 is_l1c_ready, is_not_warp_waiting_in_programmer_barrier,
@@ -1106,16 +1249,42 @@ void Subcore::issue(SM *shared_sm) {
                 is_write_available_result_queue_for_fixed_latency_available,
                 is_not_yield, is_stall_counter_0, are_wait_barriers_ready,
                 is_not_warp_waiting_ldgdepbar);
-            issue_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
-                                         c_warp->get_kernel_info()->name(),
-                                         op_type_to_string(pI->op), stall_reason,
-                                         false);
-            // Qi: buffer this stall; classified starved/non-starved once
-            // this subcore's full warp scan for the cycle is done (below).
-            m_debug_stall_events_kernel_uid = c_warp->get_kernel_info()->get_uid();
-            m_debug_stall_events_kernel_name = c_warp->get_kernel_info()->name();
-            m_debug_stall_events_this_cycle.emplace_back(
-                op_type_to_string(pI->op), stall_reason);
+            if (m_config->subcore_issue_debug) {
+              issue_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
+                                           c_warp->get_kernel_info()->name(),
+                                           op_type_to_string(pI->op), stall_reason,
+                                           false);
+              pc_stall_histogram_record(c_warp->get_kernel_info()->get_uid(),
+                                        c_warp->get_kernel_info()->name(), pI->pc,
+                                        op_type_to_string(pI->op), stall_reason, false);
+              // Qi: buffer this stall; classified starved/non-starved once
+              // this subcore's full warp scan for the cycle is done (below).
+              m_debug_stall_events_kernel_uid = c_warp->get_kernel_info()->get_uid();
+              m_debug_stall_events_kernel_name = c_warp->get_kernel_info()->name();
+              m_debug_stall_events_this_cycle.emplace_back(
+                  op_type_to_string(pI->op), stall_reason);
+            }
+            // Qi: live per-cycle issue-wait trace (-issue_wait_trace_debug 1), SM0 only
+            if (is_issue_wait_trace_active) {
+              int raw_collision_reg = -1;
+              int war_collision_reg = -1;
+              if (strcmp(stall_reason, "scoreboard") == 0 &&
+                  use_traditional_scoreboarding) {
+                raw_collision_reg =
+                    shared_sm->get_scoreboard()->find_first_collision_remodeling(
+                        sm_warp_id, pI);
+                war_collision_reg =
+                    shared_sm->get_scoreboard_WAR()->find_first_collision_remodeling(
+                        sm_warp_id, pI);
+              }
+              gpgpu_sim *gpu = shared_sm->get_gpu();
+              printf("[issue_wait_trace] sm=%u subcore=%u warp=%u dyn_warp=%u pc=0x%x "
+                     "op=%s cycle=%llu issued=0 reason=%s raw_reg=%d war_reg=%d\n",
+                     m_sm->get_sid(), m_subcore_id, sm_warp_id,
+                     c_warp->get_dynamic_warp_id(), pI->pc, op_type_to_string(pI->op),
+                     gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle, stall_reason,
+                     raw_collision_reg, war_collision_reg);
+            }
           }
           if(!are_switch_warp_conditions_ready) {
             // has_been_possible_to_switch_warp = true;
@@ -1416,7 +1585,30 @@ std::vector<unsigned int> Subcore::order_greedy_then_highest_id(SM *shared_sm, u
   std::vector<unsigned int> result_list;
   std::vector<shd_warp_t*> temp = m_warps_of_subcore;
   result_list.push_back(greedy_pointer);
-  std::sort(temp.begin(), temp.end(), sort_warps_by_highest_id_dynamic_id);
+  if (m_config->is_subcore_random_tiebreak_issue_scheduler) {
+    // Qi: greedy-then-random tie-break -- keep ready warps ahead of
+    // done/waiting ones (same as sort_warps_by_highest_id_dynamic_id), but
+    // shuffle the order among the ready warps instead of always favoring
+    // the highest dynamic_warp_id. Targets the deterministic seed bias in
+    // finilized_warps_assignation() without forcing strict round-robin.
+    std::vector<shd_warp_t*> ready, not_ready;
+    for (auto c_warp : temp) {
+      if (c_warp && (c_warp->done_exit() || c_warp->waiting())) {
+        not_ready.push_back(c_warp);
+      } else {
+        ready.push_back(c_warp);
+      }
+    }
+    for (int i = (int)ready.size() - 1; i > 0; i--) {
+      int j = rand() % (i + 1);
+      std::swap(ready[i], ready[j]);
+    }
+    temp.clear();
+    temp.insert(temp.end(), ready.begin(), ready.end());
+    temp.insert(temp.end(), not_ready.begin(), not_ready.end());
+  } else {
+    std::sort(temp.begin(), temp.end(), sort_warps_by_highest_id_dynamic_id);
+  }
   for(auto c_warp : temp) {
     unsigned int warp_subcore_id = translate_warp_id_of_sm_to_subcore( c_warp->get_warp_id(), shared_sm->get_num_subcores() );
     if(!c_warp->done_exit() && (warp_subcore_id != greedy_pointer)) {
@@ -1692,6 +1884,12 @@ void Subcore::fetch(SM *shared_sm) {
           delete mf;
         }
 
+        if (m_config->is_subcore_fetch_round_robin_independent) {
+          // Qi: advance fetch's own pointer regardless of issue priority, so a
+          // warp that keeps winning issue arbitration can't also permanently
+          // monopolize the shared fetch slot against its subcore-mate.
+          m_greedy_pointer_fetch = (subcore_warp_id + 1) % m_warps_of_subcore.size();
+        }
         break;
       }
     }

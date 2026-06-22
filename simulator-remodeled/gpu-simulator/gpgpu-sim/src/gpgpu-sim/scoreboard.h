@@ -58,6 +58,8 @@
 #include <stdlib.h>
 #include <set>
 #include <vector>
+#include <unordered_map>
+#include <utility>
 #include "assert.h"
 
 #ifndef SCOREBOARD_H_
@@ -83,11 +85,36 @@ class Scoreboard {
   void printContents() const;
   const bool islongop(unsigned warp_id, unsigned regnum);
 
+  // Qi: register bypass/forwarding network (-is_register_bypass_forwarding_enabled).
+  // Models a small number of bypass paths that let a RAW-dependent consumer read a
+  // producer's result directly (skipping the register-file writeback round trip) if
+  // the consumer issues within `window_cycles` of the producer leaving EX, and a
+  // bypass port is still free for that subcore this cycle. WAW hazards (collisions on
+  // the issuing instruction's own destination registers) are never bypass-eligible --
+  // only true RAW (source-operand) collisions can be forwarded.
+  bool checkCollision_remodeling_with_bypass(unsigned wid, const class warp_inst_t *inst,
+                                              unsigned int subcore_id,
+                                              unsigned long long cur_cycle,
+                                              unsigned int window_cycles,
+                                              unsigned int ports_per_subcore);
+  // valid_from_cycle defaults to "now" (immediately forwardable), matching the original
+  // EX-finish call site. Passing a future cycle models a shorter, earlier-stage forward
+  // path (e.g. early-forward from a SP_OP's ALU output before its full EX latency
+  // elapses) -- see SM::maybe_record_register_bypass_early.
+  void recordBypassWrite(unsigned wid, unsigned int reg_id, unsigned long long expire_cycle,
+                          unsigned long long valid_from_cycle = 0);
+
  private:
   void reserveRegister(unsigned wid, unsigned regnum);
   unsigned int get_sid() const { return m_sid; }
 
   unsigned int m_sid;
+
+  // Qi: bypass/forwarding network state -- see checkCollision_remodeling_with_bypass above.
+  // value = {valid_from_cycle, expire_cycle}
+  std::vector<std::unordered_map<unsigned int, std::pair<unsigned long long, unsigned long long> > > m_bypass_forward_table;
+  std::unordered_map<unsigned int, unsigned int> m_bypass_ports_used_this_cycle;               // [subcore_id]
+  std::unordered_map<unsigned int, unsigned long long> m_bypass_ports_last_reset_cycle;        // [subcore_id]
 
   bool m_is_trace_mode;
 

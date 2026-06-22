@@ -3833,6 +3833,51 @@ barrier_set_t::barrier_set_t(shader_core_ctx_wrapper *shader,
   for (unsigned i = 0; i < max_barriers_per_cta; i++) {
     m_bar_id_to_warps[i].reset();
   }
+  m_bar_warp_arrival_cycle.assign(max_barriers_per_cta,
+                                  std::vector<unsigned long long>(
+                                      max_warps_per_core, 0));
+  m_bar_sync_pc.assign(max_barriers_per_cta, 0);
+}
+
+void barrier_set_t::trace_barrier_release(unsigned cta_id, unsigned bar_id,
+                                            warp_inst_t *inst,
+                                            warp_set_t at_barrier,
+                                            unsigned long long release_cycle) {
+  const shader_core_config *cfg = m_shader->get_config();
+  if (!cfg->subcore_issue_debug || m_shader->get_sid() != 0 || cta_id != 0 ||
+      inst->op != BARRIER_OP) {
+    return;
+  }
+
+  unsigned long long min_arrival = release_cycle;
+  unsigned long long max_arrival = 0;
+  for (unsigned w = 0; w < m_max_warps_per_core; ++w) {
+    if (!at_barrier.test(w)) continue;
+    unsigned long long arrival = m_bar_warp_arrival_cycle[bar_id][w];
+    if (arrival < min_arrival) min_arrival = arrival;
+    if (arrival > max_arrival) max_arrival = arrival;
+  }
+
+  printf(
+      "[bar_release_trace] cta=%u bar_id=%u pc=0x%x n_warps=%u "
+      "release_cycle=%llu spread=%llu arrivals=",
+      cta_id, bar_id, m_bar_sync_pc[bar_id], (unsigned)at_barrier.count(),
+      release_cycle, max_arrival - min_arrival);
+  for (unsigned w = 0; w < m_max_warps_per_core; ++w) {
+    if (!at_barrier.test(w)) continue;
+    printf("w%u:%llu", w, m_bar_warp_arrival_cycle[bar_id][w]);
+    if (w + 1 < m_max_warps_per_core) {
+      bool more = false;
+      for (unsigned w2 = w + 1; w2 < m_max_warps_per_core; ++w2) {
+        if (at_barrier.test(w2)) {
+          more = true;
+          break;
+        }
+      }
+      if (more) printf(",");
+    }
+  }
+  printf("\n");
 }
 
 // during cta allocation
@@ -3891,6 +3936,12 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   }
   assert(w->second.test(warp_id) == true);  // warp is in cta
 
+  const unsigned long long arrival_cycle = m_shader->get_current_gpu_cycle();
+  m_bar_warp_arrival_cycle[bar_id][warp_id] = arrival_cycle;
+  if (m_bar_sync_pc[bar_id] == 0) {
+    m_bar_sync_pc[bar_id] = inst->pc;
+  }
+
   m_bar_id_to_warps[bar_id].set(warp_id);
   if (bar_type == SYNC || bar_type == RED) {
     m_warp_at_barrier.set(warp_id);
@@ -3901,8 +3952,15 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
   if (bar_count == (unsigned)-1) {
     if (at_barrier == active) {
       // all warps have reached barrier, so release waiting warps...
+      trace_barrier_release(cta_id, bar_id, inst, at_barrier, arrival_cycle);
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
+      for (unsigned w = 0; w < m_max_warps_per_core; ++w) {
+        if (at_barrier.test(w)) {
+          m_bar_warp_arrival_cycle[bar_id][w] = 0;
+        }
+      }
+      m_bar_sync_pc[bar_id] = 0;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_barrier);
       }else if(inst->op == MEMORY_BARRIER_OP) {
@@ -3914,8 +3972,15 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
     if ((at_barrier.count() * m_warp_size) == bar_count) {
       // required number of warps have reached barrier, so release waiting
       // warps...
+      trace_barrier_release(cta_id, bar_id, inst, at_barrier, arrival_cycle);
       m_bar_id_to_warps[bar_id] &= ~at_barrier;
       m_warp_at_barrier &= ~at_barrier;
+      for (unsigned w = 0; w < m_max_warps_per_core; ++w) {
+        if (at_barrier.test(w)) {
+          m_bar_warp_arrival_cycle[bar_id][w] = 0;
+        }
+      }
+      m_bar_sync_pc[bar_id] = 0;
       if (bar_type == RED) {
         m_shader->broadcast_barrier_reduction(cta_id, bar_id, at_barrier);
       }

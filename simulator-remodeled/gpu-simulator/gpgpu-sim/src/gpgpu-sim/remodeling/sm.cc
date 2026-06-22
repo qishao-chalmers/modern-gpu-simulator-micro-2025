@@ -47,6 +47,8 @@
 
 #include "../../../../../util/traces_enhanced/src/traced_operand.h"
 
+#include <sstream>
+
 
 namespace {
 
@@ -466,20 +468,131 @@ void SM::maybe_release_scoreboard_at_ex(warp_inst_t *instruction) {
   }
 }
 
+// Qi: register bypass/forwarding network (-is_register_bypass_forwarding_enabled).
+// Called at the same EX-completion point as maybe_release_scoreboard_at_ex, but
+// independent of it: this only marks the instruction's destination registers as
+// forwardable for a short window -- it never releases the real scoreboard claim, so
+// WAW ordering and the full RF-writeback timing model stay intact. The bypass-aware
+// scoreboard check in Subcore::issue() is what actually lets a RAW-dependent consumer
+// skip the wait when a forwarded value is available and a bypass port is free.
+void SM::maybe_record_register_bypass(warp_inst_t *instruction) {
+  if (!m_config->is_register_bypass_forwarding_enabled) {
+    return;
+  }
+  if (!instruction->get_extra_trace_instruction_info().has_destination_registers()) {
+    return;
+  }
+  unsigned int warp_id = instruction->warp_id();
+  unsigned long long cur_cycle = m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
+  unsigned long long expire_cycle =
+      cur_cycle + (unsigned long long)m_config->register_bypass_window_cycles;
+  unsigned int num_dsts =
+      instruction->get_extra_trace_instruction_info().get_num_destination_registers();
+  for (unsigned int r = 0; r < num_dsts; r++) {
+    traced_operand &op = instruction->get_extra_trace_instruction_info().get_operand(r);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_config->is_trace_mode)) {
+      for (unsigned int i = 0;
+           i < get_number_of_uses_per_operand(instruction->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), r, op_type);
+           i++) {
+        unsigned int final_reg_id =
+            translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + i;
+        m_scoreboard->recordBypassWrite(warp_id, final_reg_id, expire_cycle);
+      }
+    }
+  }
+}
+
+// Qi: early-forward path for SP_OP only (-register_early_forward_sp_op_enabled). Real
+// H100 SASS for k3's FFMA/FMUL dequant-accumulate chain sustains ~1.2-cycle effective
+// dependent latency (notes Sec.23.22/23.24), far below this model's 4-cycle EX latency
+// -- the existing maybe_record_register_bypass only forwards *after* full EX latency
+// elapses, so it can't shorten that wait at all, only the EX-finish-to-WB gap. This
+// records the bypass entry at dispatch instead, valid starting register_early_forward_
+// delay_cycles from now (modeling early ALU-output forwarding), for the same window
+// length as the regular bypass network. Called from functional_unit::issue() at the
+// moment an instruction leaves the issue stage and enters the FU's dispatch register --
+// it does not touch the real scoreboard claim or EX-finish timing, so WAW ordering and
+// the full RF-writeback model are unaffected; it only gives RAW consumers an earlier
+// chance to forward.
+void SM::maybe_record_register_bypass_early(warp_inst_t *instruction, operation_pipeline_t op_pipe) {
+  if (!m_config->is_register_bypass_forwarding_enabled ||
+      !m_config->is_register_early_forward_sp_op_enabled) {
+    return;
+  }
+  if (op_pipe != SP__OP) {
+    return;
+  }
+  if (!instruction->get_extra_trace_instruction_info().has_destination_registers()) {
+    return;
+  }
+  unsigned int warp_id = instruction->warp_id();
+  unsigned long long cur_cycle = m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
+  unsigned long long valid_from_cycle =
+      cur_cycle + (unsigned long long)m_config->register_early_forward_delay_cycles;
+  unsigned long long expire_cycle =
+      valid_from_cycle + (unsigned long long)m_config->register_bypass_window_cycles;
+  unsigned int num_dsts =
+      instruction->get_extra_trace_instruction_info().get_num_destination_registers();
+  for (unsigned int r = 0; r < num_dsts; r++) {
+    traced_operand &op = instruction->get_extra_trace_instruction_info().get_operand(r);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_config->is_trace_mode)) {
+      for (unsigned int i = 0;
+           i < get_number_of_uses_per_operand(instruction->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), r, op_type);
+           i++) {
+        unsigned int final_reg_id =
+            translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + i;
+        m_scoreboard->recordBypassWrite(warp_id, final_reg_id, expire_cycle, valid_from_cycle);
+      }
+    }
+  }
+}
+
 void SM::instruction_retirement(warp_inst_t *instruction) {
   unsigned int warp_id = instruction->warp_id();
   print_sync_instruction_debug(this, instruction, "commit");
-  // Qi: per-warp committed-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
-  if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
-    printf("[commit_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
+  // Qi: per-warp committed-instruction tracing for SM0, all warps (-subcore_issue_debug 1)
+  if (m_config->subcore_issue_debug && m_sm_id == 0) {
+    unsigned long long commit_cycle = m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
+    // Qi: annotate operands as dst/src directly from the static trace info, so the
+    // register dependency (RAW/WAW) between consecutive commit_trace lines for the
+    // same warp can be read off without a separate static-JSON lookup.
+    std::string opcode_str;
+    std::string operands_str;
+    {
+      traced_instruction &info = instruction->get_extra_trace_instruction_info();
+      opcode_str = info.get_op_code();
+      unsigned int num_dsts = info.get_num_destination_registers();
+      std::size_t num_operands = info.get_num_operands();
+      std::stringstream oss;
+      oss << "[";
+      for (std::size_t i = 0; i < num_operands; i++) {
+        if (i > 0) oss << ",";
+        oss << info.get_operand(i).get_operand_string()
+            << (i < num_dsts ? "(dst)" : "(src)");
+      }
+      oss << "]";
+      operands_str = oss.str();
+    }
+    printf("[commit_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s opcode=%s operands=%s "
+           "issue_cycle=%llu commit_cycle=%llu duration=%llu\n",
            m_sm_id, instruction->get_subcore_id(), warp_id,
            instruction->pc, op_type_to_string(instruction->op),
-           m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+           opcode_str.c_str(), operands_str.c_str(),
+           instruction->get_issue_cycle(), commit_cycle,
+           commit_cycle - instruction->get_issue_cycle());
   }
-  // Qi: always-on SM0 commit-progress heartbeat, every 1k committed instructions
+  // Qi: SM0 commit-progress heartbeat, every 10k committed instructions, always on (not gated by -subcore_issue_debug)
   if (m_sm_id == 0) {
     m_committed_inst_count_progress++;
-    if (m_committed_inst_count_progress % 1000 == 0) {
+    if (m_committed_inst_count_progress % 10000 == 0) {
       printf("[commit_progress] sm=0 committed_insts=%llu cycle=%llu\n",
              m_committed_inst_count_progress,
              m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
@@ -537,14 +650,6 @@ void SM::issue_warp(register_set_uniptr &pipe_reg_set, warp_inst_t *next_inst,
   func_exec_inst(*pipe_reg);
 
   print_sync_instruction_debug(this, pipe_reg.get(), "issue");
-
-  // Qi: per-warp issued-instruction tracing for SM0/warp0 (-subcore_issue_debug 1)
-  if (m_config->subcore_issue_debug && m_sm_id == 0 && warp_id == 0) {
-    printf("[issue_trace] sm=%u subcore=%u warp=%u pc=0x%x op=%s cycle=%llu\n",
-           m_sm_id, subcore_id, warp_id, pipe_reg->pc,
-           op_type_to_string(pipe_reg->op),
-           m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
-  }
 
   // if(m_sm_id == 0 && subcore_id == 0 && ((*pipe_reg)->pc==0x260 || (*pipe_reg)->pc==0x2c0)) { // && warp_id == 0) {
   //   std::cout << "Measure. Issue. SM: " << m_sm_id << ". Subcore: " << subcore_id << ". Warp_ID: " << warp_id << ". PC: " << std::hex << (*pipe_reg)->pc << std::dec << ". Cycle: " << get_current_gpu_cycle() << std::endl;

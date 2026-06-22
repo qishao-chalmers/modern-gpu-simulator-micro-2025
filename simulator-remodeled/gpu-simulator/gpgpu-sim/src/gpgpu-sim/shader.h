@@ -1352,6 +1352,10 @@ class barrier_set_t {
   void dump();
 
  private:
+  void trace_barrier_release(unsigned cta_id, unsigned bar_id,
+                             warp_inst_t *inst, warp_set_t at_barrier,
+                             unsigned long long release_cycle);
+
   unsigned m_max_cta_per_core;
   unsigned m_max_warps_per_core;
   unsigned m_max_barriers_per_cta;
@@ -1361,6 +1365,9 @@ class barrier_set_t {
   warp_set_t m_warp_active;
   warp_set_t m_warp_at_barrier;
   shader_core_ctx_wrapper *m_shader;
+  // Per (bar_id, warp_id) arrival cycle for the current pending barrier round.
+  std::vector<std::vector<unsigned long long>> m_bar_warp_arrival_cycle;
+  std::vector<address_type> m_bar_sync_pc;
 };
 
 struct insn_latency_info {
@@ -2017,6 +2024,8 @@ class shader_core_config : public core_config {
   bool is_skip_rf_limit_enabled; // MOD. Skip RF limitation.
   bool is_relax_barriers_baseline; // MOD. Relax barriers in baseline
   bool is_subcore_round_robin_issue_scheduler; // Qi: round-robin subcore issue priority instead of greedy-then-highest-id
+  bool is_subcore_fetch_round_robin_independent; // Qi: decouple fetch priority pointer from issue priority pointer (own round-robin)
+  bool is_subcore_random_tiebreak_issue_scheduler; // Qi: greedy-then-random tie-break instead of greedy-then-highest-id
   bool is_scoreboard_release_at_ex; // Qi: release scoreboard at FU completion (EX), not RF writeback
 
   concrete_scheduler warp_scheduling_mode;
@@ -2028,6 +2037,7 @@ class shader_core_config : public core_config {
   unsigned int subcore_issue_debug_summary_interval; // gpu cycles; 0=end only
   unsigned int subcore_issue_debug_print_period; // verbose line every N logged cycles
   unsigned long long subcore_issue_debug_stop_gpu_cycle; // 0=run to completion
+  bool issue_wait_trace_debug; // Qi: live per-cycle [issue_wait_trace] for every warp on SM0 (issued or not, and why not)
 
 
   // MOD. Begin. Extended IBuffer
@@ -2074,6 +2084,17 @@ class shader_core_config : public core_config {
   int tensor_rate_per_cycle;
   int tensor_initiation_cycles_override;
   int tensor_dependent_latency_override;
+  // Qi: register bypass/forwarding network -- lets a RAW-dependent consumer read a
+  // producer's result before it's fully written back to the RF, within a short window
+  // and bounded by a limited number of bypass ports per subcore per cycle.
+  bool is_register_bypass_forwarding_enabled;
+  int register_bypass_window_cycles;
+  int register_bypass_ports_per_subcore;
+  // Qi: early-forward path for SP_OP only -- marks the bypass entry at dispatch instead
+  // of at EX-finish, available after register_early_forward_delay_cycles instead of the
+  // full EX latency. See SM::maybe_record_register_bypass_early.
+  bool is_register_early_forward_sp_op_enabled;
+  int register_early_forward_delay_cycles;
   int branch_latency;
   int half_latency;
   int uniform_latency;

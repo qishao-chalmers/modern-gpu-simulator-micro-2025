@@ -69,6 +69,7 @@ Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu, bool 
   // Initialize size of table
   reg_table.resize(n_warps);
   longopregs.resize(n_warps);
+  m_bypass_forward_table.resize(n_warps);
 
   m_gpu = gpu;
 }
@@ -267,6 +268,85 @@ int Scoreboard::find_first_collision_remodeling(
     }
   }
   return -1;
+}
+
+// Qi: record that `reg_id` (one of `inst`'s own destination registers, already passed
+// in by the caller) becomes forwardable via the bypass network from `valid_from_cycle`
+// (default: now) until `expire_cycle`.
+void Scoreboard::recordBypassWrite(unsigned wid, unsigned int reg_id, unsigned long long expire_cycle,
+                                    unsigned long long valid_from_cycle) {
+  m_bypass_forward_table[wid][reg_id] = std::make_pair(valid_from_cycle, expire_cycle);
+}
+
+// Qi: like checkCollision_remodeling, but a RAW-only collision (the colliding register
+// is one of `inst`'s *source* operands, not one of its own destinations) can be
+// satisfied by the bypass network instead of blocking issue, if a forwarded write for
+// that exact register is still within its window and a bypass port is free this cycle
+// for `subcore_id`. WAW collisions (the colliding register is also one of `inst`'s own
+// destinations) are never bypass-eligible -- those still block, same as before.
+bool Scoreboard::checkCollision_remodeling_with_bypass(
+    unsigned wid, const class warp_inst_t *inst, unsigned int subcore_id,
+    unsigned long long cur_cycle, unsigned int window_cycles,
+    unsigned int ports_per_subcore) {
+  unsigned int num_dsts =
+      inst->get_extra_trace_instruction_info().get_num_destination_registers();
+
+  std::set<unsigned int> own_dst_regs;
+  for (unsigned int r = 0; r < num_dsts; r++) {
+    traced_operand &op = inst->get_extra_trace_instruction_info().get_operand(r);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (op.get_has_reg() &&
+        !check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type,
+                                           m_is_trace_mode)) {
+      for (unsigned int j = 0;
+           j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(),
+                                              op.get_operand_reg_number(), r, op_type);
+           j++) {
+        own_dst_regs.insert(translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j);
+      }
+    }
+  }
+
+  unsigned long long &last_reset = m_bypass_ports_last_reset_cycle[subcore_id];
+  unsigned int &used = m_bypass_ports_used_this_cycle[subcore_id];
+  if (last_reset != cur_cycle) {
+    last_reset = cur_cycle;
+    used = 0;
+  }
+
+  bool real_collision = false;
+  std::size_t num_operands = inst->get_extra_trace_instruction_info().get_num_operands();
+  for (unsigned int i = 0; i < num_operands; i++) {
+    traced_operand &op = inst->get_extra_trace_instruction_info().get_operand(i);
+    TraceEnhancedOperandType op_type = get_reg_type_eval(op);
+    if (!op.get_has_reg() ||
+        check_is_reserved_regs_remodeling(op.get_operand_reg_number(), op_type, m_is_trace_mode)) {
+      continue;
+    }
+    for (unsigned int j = 0;
+         j < get_number_of_uses_per_operand(inst->get_extra_trace_instruction_info(),
+                                            op.get_operand_reg_number(), i, op_type);
+         j++) {
+      unsigned int final_reg_id =
+          translate_reg_to_global_id(op.get_operand_reg_number(), op_type) + j;
+      if (reg_table[wid].find(final_reg_id) == reg_table[wid].end()) {
+        continue;  // no hazard on this register
+      }
+      if (i < num_dsts || own_dst_regs.find(final_reg_id) != own_dst_regs.end()) {
+        real_collision = true;  // WAW -- never bypass-eligible
+        continue;
+      }
+      auto it = m_bypass_forward_table[wid].find(final_reg_id);
+      bool bypass_available = (it != m_bypass_forward_table[wid].end()) &&
+                               (cur_cycle >= it->second.first) && (cur_cycle <= it->second.second);
+      if (bypass_available && used < ports_per_subcore) {
+        used++;  // forwarded -- does not block issue
+        continue;
+      }
+      real_collision = true;
+    }
+  }
+  return real_collision;
 }
 
 /**

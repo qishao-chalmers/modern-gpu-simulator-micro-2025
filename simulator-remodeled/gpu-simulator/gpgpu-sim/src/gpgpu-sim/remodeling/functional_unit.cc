@@ -171,6 +171,7 @@ void functional_unit::issue(register_set_uniptr &source_reg) {
     }
 
     m_sm->incexecstat(ready_reg);
+    m_sm->maybe_record_register_bypass_early(ready_reg, m_type_of_pipeline);
     source_reg.move_out_to(m_dispatch_reg);
   }
 }
@@ -232,11 +233,13 @@ bool functional_unit::instruction_finishing_execution(std::unique_ptr<warp_inst_
       if(is_fixed_latency_unit()) {
         assert(m_rf_write_queue->has_free());
         m_sm->maybe_release_scoreboard_at_ex(pipe_reg_target.get());
-        m_rf_write_queue->move_in(pipe_reg_target);   
+        m_sm->maybe_record_register_bypass(pipe_reg_target.get());
+        m_rf_write_queue->move_in(pipe_reg_target);
         retired = true;
       }else {
         if(m_rf_write_queue->has_free()) {
           m_sm->maybe_release_scoreboard_at_ex(pipe_reg_target.get());
+          m_sm->maybe_record_register_bypass(pipe_reg_target.get());
           m_rf_write_queue->move_in(pipe_reg_target);
           retired = true;
         }

@@ -1246,10 +1246,34 @@ own).**
 1. **Quantify skew mechanism**: compare `[sync_issue_trace] inst_in_pipe` + issue/commit traces between early vs
    late warps through one full loop body; test `-max_pops_per_cycle_register_file_write_queue_for_fixed_latency_instructions`
    (§9 item 10 ruled out width=4, but mechanism may be latency-shaped not width-shaped).
-2. **Sectored vs normal L2 on warp spread**: re-run §22.2 analysis on sectored L2 isolated log — if spread at
-   `pc=0x10020` is similar but cycles differ, L2 sectoring affects latency more than skew.
+2. **Sectored vs normal L2 on warp spread**: **done** — see §22.6. Spread shrinks modestly (~14%) but persists at
+   the same order of magnitude → L2 sectoring affects latency far more than skew, confirming the prediction.
 3. **Full-chip L2-normal**: **done** — `dl2_normal_k3_fullchip.log`, **216,392 cyc** (−18.5% vs baseline). Remaining
    gap vs real: **+30.2%**.
+
+### 22.6 Warp-arrival spread under L2-normal (isolated 1-SM/1-CTA) — resolves §22.4 item 2
+
+Re-ran the `[bar_arrival_trace]` capture (single-SM isolation, `-debug_isolate_sm_id`/`-gpgpu_max_cta 1`) with the
+L2-normal config (`SM90_H100_l2norm_l1dnorm`). `gpu_tot_sim_cycle = 191,627` — matches the known L2-normal isolated
+total exactly (sanity check passed).
+
+`pc=0x10020` spread, 15 rounds: 762, 816, 782, 750, 801, 779, 654, 1026, 649, 763, 754, 292, 246, 958, 808
+→ avg **722.7**, max **1026**, min **246**.
+
+| | Sectored L2 isolated (§18) | Normal L2 isolated (this run) |
+|---|---|---|
+| Rounds | 14 | 15 |
+| Spread avg | ~837 | **722.7** (−13.7%) |
+| Spread max | 1170 | **1026** (−12.3%) |
+| Spread min | 517 | **246** |
+
+**Conclusion**: the skew shrinks modestly under L2-normal but is clearly not eliminated — still 246–1026 cyc per
+round, still an order of magnitude above this kernel's other barriers (75–519 cyc, §14), still highly
+round-to-round variable (not a fixed latency offset). This confirms §22.3's read: L2 sectoring's −12%
+(isolated)/−18.5% (full-chip) cycle win comes mainly from cutting absolute per-load DRAM round-trip cost, not
+from making warps finish more uniformly. The warp-to-warp skew at `pc=0x10020` remains a largely independent,
+unsolved mechanism — §22.4 item 1 (RF-writeback/scoreboard-release timing, `inst_in_pipe` disparity) is still the
+best lead.
 
 ### 22.5 Code changes this session (uncommitted)
 
@@ -1290,8 +1314,1022 @@ own).**
 | `gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-cache.cc` | §22.1: `baseline_cache::fill()` + `tex_cache::fill()` normal-L2 workaround; §22.5 uncommitted |
 | `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` | §22.5: `[sync_issue_trace]` / `[sync_commit_trace]` (uncommitted) |
 | `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/warp_dependency_state.{h,cc}` | §22.5: `outstanding_mem_pcs` FIFO tracking (uncommitted) |
+| `gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h` | §23.4: `get_issue_cycle()` getter |
+| `log/tmp_log/k3_l2norm_all_traces_v2.log` | §23.4-23.6: all-warps `commit_trace` + `mem_request_trace` + `bar_arrival_trace` capture; source of the barrier-stall-fraction and issue-rate calculations |
+| `log/tmp_log/k3_l2norm_rr_issue_bar_arrival.log` | §23.3: round-robin issue-scheduler test (198,541 cyc, worse) |
+| `log/tmp_log/k3_l2norm_random_tiebreak.log` | §23.3: greedy-then-random tie-break test (191,943 cyc, spread −8 to −17%) |
+| `log/tmp_log/k3_l2norm_scoreboard_ex.log` | §23.9: `-is_scoreboard_release_at_ex 1` validated to completion (191,704 cyc) |
+| `log/tmp_log/k3_l2norm_skiprf.log` | §23.8: `-is_skip_rf_limit_enabled 1`, 4 CTAs/SM sensitivity test (794,079 cyc) |
+| `log/tmp_log/k3_l2norm_rfwq4.log`, `k3_l2norm_rfwq8.log` | §23.9: write-queue pop-rate 4 vs 8 (identical, saturates at 4) |
+| `log/tmp_log/k3_l2norm_rflat8.log` | §23.9: RF-latency-bound 24→8 (byte-identical to baseline, wrong knob) |
+| `../h100_real_profile/k3_occupancy_starvation_check.csv` | §23.7: real H100 ncu profile of this exact kernel, used for the occupancy/issue-rate cross-check |
 
 ---
+
+## 23. Subcore issue-priority root cause, occupancy cross-check vs real H100, and a string of ruled-out scoreboard-timing knobs — 2026-06-20/21
+
+### 23.1 Memory/compute resource sharing across subcores — reference answer
+
+Checked object lifetimes directly in code (not assumed). Per-subcore (4 independent copies per SM):
+tensor core (`m_tensor_pipeline`, `subcore.cc:1724`), SP/INT/SFU/branch/uniform pipelines, register file
+(`m_regular_rf`), and the tiny L0 instruction/constant caches (`m_L0I`/`m_L0C_cache`, named e.g. `L0I_000_3`).
+SM-wide/shared across all 4 subcores: the entire `ldst_unit_sm` (L1D, L1C, L1T, PRT, MSHR, the one port to
+icnt/L2/DRAM — created once in `sm.cc:1009`), shared memory (lives inside `ldst_unit_sm`), the scoreboard
+(`m_scoreboard`, one per SM, `shader.cc:322`), and optionally the DP pipeline (`-is_dp_pipeline_shared_for_subcores`).
+
+### 23.2 Root cause of the subcore-pair warp skew: a deterministic fetch/issue-priority seed
+
+`Subcore::finilized_warps_assignation()` (`subcore.cc:1706-1709`) seeds both `m_greedy_pointer_issue` and
+`m_greedy_pointer_fetch` to `m_warps_of_subcore.size() - 1` — i.e. local index 1 in each subcore (warps 4-7,
+since subcores hold `{warp_id, warp_id+4}` pairs) — **before the kernel runs a single cycle**. Combined with
+`order_greedy_then_highest_id()` (`subcore.cc:1415-1442`, ties always favor highest `dynamic_warp_id`) and the
+"stick to whoever issued last" rule (`subcore.cc:1096`), this gives warps 4-7 a deterministic, compounding head
+start over their subcore partners 0-3.
+
+Confirmed directly via the new all-warps `commit_trace` (§23.4): at the kernel's very first instruction
+(`pc=0x10`), warps 4-7 issue at `cycle=1504`, warps 0-3 at `cycle=1511` — a 7-cycle gap **before any compute,
+memory access, or divergence has happened**. The gap then rides through unchanged to the first barrier
+(`pc=0x330`: warps 4-7 commit `BARRIER_OP` at cycle 1715, warps 0-3 at 1721 — same 6-7 cycle gap, same 7-cycle
+BARRIER_OP execution latency for both groups, proving the gap predates the barrier entirely). Later in the
+kernel this same seed compounds into the much larger texture-load gaps already documented in §18/§22
+(e.g. `pc=0xf470`/`0xf9b0`: 577-647 cycles by mid-kernel) via the same "stick to last issuer" mechanism.
+
+**Initially mis-identified as "subcore-index-dependent" (odd vs even)** from a 5-round sample — ruled out by
+extending to all 15 rounds: the pattern (subcore 1/3 large gap, 0/2 small gap) completely breaks down by round
+8, with magnitude and sign both drifting unpredictably thereafter. The real, robust signature across all 15
+rounds is leadership **drift/sign-flips** (whichever subcore-partner gets ahead first tends to stay ahead for a
+while, but can lose that lead when it stalls) — consistent with the deterministic seed plus the self-reinforcing
+"sticky greedy" rule, not a fixed hardware asymmetry.
+
+**Addendum (confirmed generalizes to the output epilogue too)**: same mechanism, different code region. In
+`k3_all_debug.log`, subcore 1's warp1 shows a 68-cycle gap between issuing `pc=0x180e0` (cycle 182943) and
+`pc=0x180f0` (cycle 183011) — but its subcore-mate warp5 issued the *identical* PCs ~450 cycles earlier and was
+actively issuing every 5-7 cycles throughout that exact window. Ruled out the L0 I-cache as the cause first
+(`L0I_total_cache_misses = 0` for the entire run — zero real misses anywhere) before attributing it to fetch/issue
+port sharing: `Subcore::fetch()`/`Subcore::issue()` both allow exactly one warp through their shared per-subcore
+port per cycle, prioritized by the same `order_greedy_then_highest_id()`/"stick to whoever issued last" rule. Since
+warp5 had a continuous stream of ready instructions, it kept winning both arbitrations every cycle, and warp1's
+`is_next_valid()` check on its own IBuffer simply never got serviced — no hazard, no stall reason logged, just
+never fetched. This is a second, distinct cause of slow store commits alongside §23.23's `RESERVATION_FAIL`/L1D
+contention: one delays *commit* after issue, this one delays *issue* itself.
+
+### 23.3 Scheduler-policy A/B tests on the seed bias
+
+| Policy | `gpu_tot_sim_cycle` (isolated 1-SM/1-CTA, L2-normal) | vs baseline | `pc=0x10020` spread avg/max | Leadership pattern |
+|---|---|---|---|---|
+| Greedy-then-highest-id (baseline) | 191,627 | — | 722.7 / 1026 | sign-flips, self-correcting |
+| `-is_subcore_round_robin_issue_scheduler 1` (true RR) | 198,541 | **+3.6% worse** | 1035.4 / 1174 | **locked-in**, warps 4-7 lead every round, no exceptions |
+| **`-is_subcore_random_tiebreak_issue_scheduler 1`** (new, this session) | 191,943 | +0.16% (flat) | **663.9 / 846** | sign-flips preserved |
+
+True round-robin is strictly worse on both axes — it removes the beneficial flexibility of letting a warp that's
+genuinely making progress keep going. The new **greedy-then-random tie-break** (randomize only the tie-break in
+`order_greedy_then_highest_id` instead of always favoring highest `dynamic_warp_id`, implemented in `subcore.cc`,
+flag registered in `gpu-sim.cc`/`shader.h`) is a real, validated improvement: −8.1% avg / −17.5% max barrier
+spread at essentially zero cycle cost, while preserving the self-correcting leadership-flip dynamics that
+strict RR destroyed. **Uncommitted.**
+
+### 23.4 `commit_trace` rework: removed `issue_trace`, added `issue_cycle`/`commit_cycle` to `commit_trace`, all 8 warps
+
+Per explicit request: deleted the separate `[issue_trace]` print in `SM::issue_warp()`; added a public
+`warp_inst_t::get_issue_cycle()` getter (`abstract_hardware_model.h`, exposing the existing protected
+`issue_cycle` member set in `warp_inst_t::issue()`); `[commit_trace]` now prints
+`issue_cycle=... commit_cycle=...` directly, and the print is no longer gated to `warp_id==0` — fires for all 8
+warps on SM0. One line now gives exact per-instruction issue→commit latency per warp, no need to correlate two
+separate trace lines. Verified: `gpu_tot_sim_cycle` unchanged (191,627), `commit_trace` fires evenly (32,599 per
+warp × 8 = 260,792 total). **Note**: `run_k3_segment_timing.sh:63` has a regex matching the old `[issue_trace]`
+format — needs updating to use the new combined field if that script is reused. **Uncommitted.**
+
+### 23.5 Barrier-stall quantified: only ~4.86% of total time — BAR.SYNC is not a major cost driver
+
+Computed directly from `[bar_arrival_trace]` across **all** barrier instances in one full isolated run (61
+instances: 4 distinct barrier PCs per loop iteration × 15 rounds + 1 kernel-start barrier — not just the
+`pc=0x10020` one focused on in §14/§18/§22): summed `(release_cycle - arrival_cycle)` per warp per barrier
+instance = **74,462 total idle warp-cycles**, against `8 warps × 191,627 cycles = 1,533,016` available
+warp-cycles → **4.86%**. Per-warp distribution is fairly even (4,216-12,882 each), no outlier.
+
+**This settles the multi-session barrier-skew thread**: however large and real the warp-to-warp arrival skew at
+`pc=0x10020` is (§14/§18/§22), it accounts for under 5% of total kernel time. BAR.SYNC *exposes* compute-rate
+differences between warps; it doesn't meaningfully *cost* cycles on its own. Confirmed independently by §23.3's
+random-tiebreak result: spread shrank 8-17% but total cycles didn't move — further proof spread reduction and
+cycle-count reduction are not the same thing here.
+
+### 23.6 The real cost driver: scoreboard stalls, not barriers, not memory
+
+Pre-existing `-subcore_issue_debug` instrumentation (added in an earlier, uncommitted-at-the-time session, never
+previously analyzed this way) already tracks per-opcode stall reasons at IBuffer head. Pulled from the isolated
+L2-normal run:
+
+```
+subcore_cycles_starved = 66.06% of subcore-cycles (no warp issuable)
+top (op, reason) pairs:
+  47.46%  SP_OP / scoreboard          9.83%  SFU_OP / cta_barrier
+   9.53%  TENSOR_CORE_OP / scoreboard 8.63%  SFU_OP / scoreboard
+   6.03%  INTP_OP / scoreboard        5.38%  LOAD_OP / scoreboard
+   4.86%  LOAD_OP / cta_barrier
+```
+Grouped by reason: **`scoreboard` ≈ 78.6%** of all stall events; `cta_barrier` ≈ 16.2% (consistent with §23.5's
+independent 4.86%-of-wall-clock measurement — most barrier *stall events* don't translate to much *wall-clock*
+idle time, since by the time a warp checks-and-stalls repeatedly the cumulative idle window is still small).
+Memory (`LOAD_OP`) is a minor contributor. **The dominant inefficiency is plain FP32 (`SP_OP`) instructions
+waiting on register-scoreboard dependencies — not memory, not barriers.**
+
+### 23.7 Real-hardware ncu cross-check (`h100_real_profile/k3_occupancy_starvation_check.csv`)
+
+Real ncu profile of the same kernel (llama-bench, qwen3 8B Q8_0, H100), pulled to check whether occupancy or the
+scoreboard-stall finding are simulator artifacts:
+
+| Metric | Real H100 (ncu) | Our simulator | Match? |
+|---|---|---|---|
+| Block Limit Registers | 1 | `CTA/core = 1, limited by: regs` | **exact** |
+| Theoretical/Achieved Occupancy | 12.50% / 12.49% | `gpu_occupancy = 12.4856%` | **exact** |
+| Active Warps Per Scheduler | 2.00 | 2 (8 warps / 4 subcores) | **exact** |
+| Block Limit Shared Mem | 1 | 4 (found via §23.8's skip-RF test) | **mismatch — open, unresolved** |
+| Issued Warp Per Scheduler | 0.49 | 0.340 (issued/(cycles×4 subcores)) | **gap: −15 points** |
+| Warp Cycles Per Issued Instruction | 4.11 | 5.88 (= 2.00 / issue_rate) | **gap: +43%** |
+
+Register count verified from trace metadata directly (not assumed): max register index referenced by the
+kernel's instructions is **R255** — the architectural maximum — confirming the register-bound, 1-CTA/SM,
+12.5%-occupancy story is a real, deliberate property of the compiled SASS (register-hungry GEMM kernel trading
+occupancy for per-thread ILP via heavy unrolling), present identically on real silicon. **Occupancy itself is
+correctly modeled and is not the source of the simulator-vs-real gap.** But the *issue-rate* at that occupancy
+is real H100 issuing ~44% more often per scheduler-cycle than our model does — three independent metrics
+(issue-rate, warp-cycles-per-instruction, and the §23.6 starvation/no-eligible comparison) agree to within
+rounding on the same ~15-percentage-point gap. **This is now the most precisely quantified open thread in the
+whole investigation.**
+
+### 23.8 Occupancy/warp-pool-size ruled out as the cause of the issue-rate gap
+
+Tested the obvious hypothesis — maybe the scheduler just doesn't have enough resident warps to find eligible
+work — using the pre-existing `-is_skip_rf_limit_enabled 1` escape hatch (`shader.cc:3500`, skips the register
+term in `shader_core_config::max_cta()`'s `min()`). Result: shared memory binds next, at **4** CTAs/SM (not 1,
+unlike real ncu's `Block Limit Shared Mem=1` — a separate, real, unresolved discrepancy in how this simulator
+computes the kernel's shared-memory footprint, flagged but not chased this session).
+
+With 4 CTAs / 32 resident warps (4x the baseline pool):
+```
+                          1 CTA/SM (baseline)   4 CTAs/SM (skip-RF, unrealistic)
+gpu_tot_sim_cycle:             191,627                794,079
+issue_rate:                     0.340                  0.347   (+2%, ~nothing)
+subcore_cycles_starved:         66.06%                 66.04%  (unchanged)
+```
+794,079 cycles for 4x the instructions is essentially exactly "4 CTAs running with zero latency-hiding benefit"
+(4×191,627 = 766,508 is the no-benefit baseline; actual came out very slightly worse, not better). **Quadrupling
+the resident warp pool gave almost no improvement in issue-rate or starvation** — ruling out "not enough warps
+available" as the explanation. This is a deliberately unrealistic test (real H100 cannot run 4 CTAs/SM for this
+kernel, confirmed by §23.7's register data) — it's a diagnostic probe, not a candidate fix.
+
+### 23.9 Knob-by-knob elimination of SP_OP/scoreboard timing levers (all isolated 1-SM/1-CTA, L2-normal)
+
+| Knob tested | Change | Result | Verdict |
+|---|---|---|---|
+| `-is_scoreboard_release_at_ex 1` (release at FU completion, not RF writeback) | existing flag, never validated to completion before (earlier session's run was killed mid-way) | 191,704 cyc (+0.04%); SP_OP/scoreboard stalls −14.2%; starvation unchanged (66.06%→66.58%) | **Ruled out** — removes some stall events but warps just hit the next stall instead; critical path unaffected |
+| `-max_pops_per_cycle_register_file_write_queue_for_fixed_latency_instructions` 1→4 | write-queue drain rate | 191,730 cyc (+0.05%); starvation 66.06%→65.58% (−0.48pp) | Small, real, free improvement — **persisted to config (1→4)** |
+| same, 4→8 | pushed further | byte-identical to the 4 result (191,730 / 65.58%) | **Saturates at 4**, no further gain |
+| `-max_latency_regular_register_file_latency` 24→8 | shrink RF "latency" | **byte-identical** to baseline (191,627 / 66.0612%, exact stall counts) | **Wrong knob** — this is a read-port-conflict bookkeeping array bound, not an actual latency; doesn't affect timing in this range |
+| (checked, not changed) `max_sp_latency` | confirmed actual value | `= fp_latency[1] = 4` cycles, from `-ptx_opcode_latency_fp 4,4,4,4,39` | Already small and realistic — **not the inflated value the gap requires** |
+
+Net: no single timing/queue/capacity constant explains the §23.7 issue-rate gap. The ~6-cycle difference between
+SP_OP's raw 4-cycle EX latency and its measured ~10-cycle average issue→commit latency is fully accounted for by
+known small fixed costs (`num_cycles_needed_to_write_a_reg_from_sm_struct_to_subcore=2` + queue insertion), none
+of which are large enough to explain a 44%/15-point gap by themselves.
+
+### 23.10 Real ncu profile fully mined — no further granular comparison available
+
+Re-pulled the complete `h100_real_profile/k3_occupancy_starvation_check.csv`: it contains only Scheduler
+Statistics, two Warp State Statistics metrics, and Occupancy (already used in §23.7) — no per-reason stall
+taxonomy (no `stall_long_scoreboard`/`stall_barrier`/`stall_exec_dependency`-style breakdown as ncu's GUI
+sometimes exposes). There is nothing more granular in this specific export to compare against §23.6's
+op×reason breakdown.
+
+### 23.11 Where this leaves the investigation
+
+The ~15-percentage-point issue-rate gap vs real H100 (§23.7), at matched occupancy, survives every config-level
+lever tried this session: scheduler fairness policy (ruled out, random-tiebreak helps spread only, not cycles),
+warp-pool size (ruled out, §23.8), and every SP_OP/scoreboard timing constant found (ruled out, §23.9). It is
+likely **not a single mistuned parameter** but something more structural in how dependency chains/instruction
+issue are modeled, requiring either a deeper architectural comparison (re-profiling real hardware with a fuller
+stall-reason breakdown than the current CSV has) or accepting it as a standing limitation of this model relative
+to real Hopper's actual per-scheduler issue logic.
+
+**Separately flagged, not yet chased**: the shared-memory-occupancy-limit mismatch found in §23.8 (our simulator
+computes 4 CTAs/SM-worth of shmem headroom for this kernel; real ncu says only 1) — a real, concrete, isolated
+discrepancy that's easier to pin down than the issue-rate gap and worth a dedicated look.
+
+### 23.12 Code changes this session (uncommitted — see `git status`)
+
+| File | Change |
+|------|--------|
+| `gpu-simulator/gpgpu-sim/src/abstract_hardware_model.h` | `warp_inst_t::get_issue_cycle()` public getter |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` | Removed `[issue_trace]`; `[commit_trace]` now all-warps with `issue_cycle=`/`commit_cycle=` |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` | `is_subcore_random_tiebreak_issue_scheduler` member |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc` | `-is_subcore_random_tiebreak_issue_scheduler` CLI registration |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc` | `order_greedy_then_highest_id()` — random tie-break among ready warps when flag enabled |
+| `gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM90_H100_l2norm_l1dnorm/gpgpusim.config` | `max_pops_per_cycle_register_file_write_queue_for_fixed_latency_instructions` 1→4 (persisted) |
+
+### 23.13 CONFIRMED: shared-memory occupancy-limit mismatch — driver carveout-tier rounding, not a units bug
+
+From §23.8: our simulator computes `CTA/core = 4, limited by: shmem` for this kernel; real ncu reports
+`Block Limit Shared Mem = 1`. Investigated to find the exact numbers (not guessed), then confirmed against the
+actual ggml/llama.cpp CUDA source (`/home/qshao/Project/Fun/llama.cpp`):
+
+- **Traced per-block shared memory request**: `57,856 bytes`, read directly out of the kernel-3 entry in
+  `dynamic_trace.pb` via the `kernel.size_shared_memory` protobuf field (compiled `kernel.proto` locally with
+  `protoc --python_out` and parsed the trace — confirmed value, not estimated).
+- **Tracer capture logic verified correct in principle**: `tracer_tool.cu:1301`,
+  `ker->set_size_shared_memory(shmem_static_nbytes + cfg.sharedMemBytes)` — sums the function's static shared
+  memory (`CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`) with the per-launch dynamic `sharedMemBytes` argument. Checked
+  all three launch-capture code paths (`extract_launch_config()`, `tracer_tool.cu:1104-1148`: plain
+  `cuLaunchKernel`/cooperative/grid-async, `cuLaunchKernelEx`, and `cuGraphAddKernelNode` for CUDA-graph-launched
+  kernels — relevant since llama.cpp launches via graphs) — all three correctly read `sharedMemBytes` from the
+  appropriate params struct. No obvious tracer bug found by inspection — the 57,856 figure is accurate.
+- **Our simulator's arithmetic is internally correct given its inputs**: `233,472 (gpgpu_shmem_size, H100's full
+  228KB architectural max) / 57,856 = 4.037 → 4`. Not a units bug (byte vs word) — shared memory is unambiguously
+  byte-denominated in the CUDA APIs on both sides; checked and ruled out explicitly.
+- **Confirmed root cause**, via `ggml/src/ggml-cuda/mmq.cuh:3886-3899` + `common.cuh:185-208`: the kernel does
+  call `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared)` (wrapped in the
+  `CUDA_SET_SHARED_MEMORY_LIMIT` macro), raising its allowed ceiling to **exactly** `nbytes_shared` — which
+  matches the traced 57,856 bytes precisely. But **`cudaFuncAttributePreferredSharedMemoryCarveout` is never
+  called anywhere in `ggml-cuda/`** (grepped the whole directory, no match) — the L1/shared-memory *split* is
+  never explicitly requested, only the size *limit*. Without an explicit carveout-preference call, the CUDA
+  driver does not grant the full physical maximum — it rounds up to the smallest **discrete carveout tier**
+  that satisfies the requested size (tiers like 8/16/32/64/100/132/164/196/227 KB on Hopper, the same kind of
+  table visible in our own config's `-gpgpu_shmem_option 0,8,16,32,64,228`). 57,856 bytes exceeds the 32KB tier
+  but fits the 64KB tier, so the driver grants only **65,536 bytes**: `65,536 / 57,856 = 1.13 → 1` — **exactly
+  matches real ncu's `Block Limit Shared Mem = 1`.** Confirmed, not just plausible.
+- **What this means for the simulator**: `-gpgpu_shmem_size 233472` models the GPU's absolute physical maximum,
+  but real CUDA only grants that to a kernel that explicitly opts into a larger carveout via
+  `cudaFuncAttributePreferredSharedMemoryCarveout` — which this kernel (and, per the grep, every other ggml-cuda
+  kernel) never does. A more accurate model would compute the occupancy-limiting shared-memory denominator as
+  the smallest carveout tier ≥ the kernel's requested `size_shared_memory`, not the flat architectural maximum.
+  **Not fixed this session** — `-gpgpu_shmem_size`/`max_cta()`'s `result_shmem` calculation in `shader.cc:3482-3485`
+  would need the tier-rounding logic added.
+- **Why this matters**: this CTA admission discrepancy (4 vs 1 — exactly the same register-style mechanism
+  investigated at length in §23.2/§23.7/§23.8, but for shared memory instead of registers) doesn't change k3's
+  own number (registers already bind at 1 regardless — §23.8), but it would matter for **any other kernel in
+  the decode/prefill pipeline where shared memory is the binding constraint and registers aren't** — those
+  kernels' simulated occupancy could be silently too high.
+- **Not chased further this session** — flagged here as a concrete, scoped, separate thread from the main
+  issue-rate gap (§23.7/§23.11), worth a dedicated look later.
+
+### 23.14 BREAKTHROUGH: WAR (anti-dependency) scoreboard hazards are 1/3 of all stalls — disabling WAR checking is a real, validated win
+
+Picking back up the §23.11 "structural, not a single mistuned parameter" thread: built a new live per-cycle
+instrumentation flag, **`-issue_wait_trace_debug`**, that reuses the pre-existing `issue_stall_primary_reason()`
+classifier but fires every cycle for every warp on SM0 (not just into the aggregate histogram) and, specifically
+for `scoreboard`-reason stalls, additionally queries both scoreboards independently
+(`find_first_collision_remodeling()` on `m_scoreboard` and `m_scoreboard_WAR`) to report which register and which
+*kind* of hazard (RAW vs WAR) is blocking issue. New code in `subcore.cc`'s issue loop (both the issued and
+stalled branches) and a new `-issue_wait_trace_debug` flag in `shader.h`/`gpu-sim.cc`.
+
+Ran it on the isolated L2-normal config (`k3_issue_wait_trace.log`, 191,730 cyc, 513,681 `[issue_wait_trace]`
+lines) and split the 197,098 `scoreboard`-reason stall events by hazard kind:
+
+| Hazard kind | Count | % of all scoreboard stalls | % of ALL stall events |
+|---|---|---|---|
+| Pure RAW only | 105,618 | 53.6% | — |
+| Pure WAR only (no RAW collision) | 83,950 | **42.6%** | **33.2%** |
+| Both RAW and WAR | 7,530 | 3.8% | — |
+
+I.e. **a third of every stall event in this kernel is a pure anti-dependency (WAR) hazard**, not a true data
+dependency. GPGPU-Sim's WAR scoreboard mode is a config knob, not a fixed behavior:
+`-scoreboard_war_mode {disabled|wb|opc}` — current/default is `opc` (release WAR claim when the instruction
+leaves the operand collector; already the less-conservative of the two enabled modes).
+
+**Test: `-scoreboard_war_mode disabled` (turn WAR checking off entirely)**
+
+| Config | Baseline | WAR disabled | Δ |
+|---|---|---|---|
+| Isolated 1-SM/1-CTA, L2-normal (`k3_war_disabled.log`) | 191,730 cyc | **185,573 cyc** | **−3.21%** |
+| Full-chip, 132 SMs, L2-normal (`k3_l2norm_war_disabled_fullchip.log`) | 216,392 cyc | **210,062 cyc** | **−2.93%** |
+
+Total committed instructions unchanged (260,792 in the isolated case) — same work, fewer stalls, faster. The
+full-chip result tracks the isolated result almost exactly (−2.93% vs −3.21%), confirming this is a real,
+scale-independent effect, not an isolated-config artifact. Scoreboard-reason stall events dropped 197,098→105,390
+in the isolated run (i.e. essentially all the pure-WAR stalls disappeared, leaving the RAW ones).
+
+**This is the first genuinely positive lever found across this entire multi-session investigation.** It narrows
+the gap to real H100 from +30.2% to **+26.35%** (210,062 vs target 166,246) on the full-chip config.
+
+Caveat — not yet verified with 100% certainty: GPGPU-Sim's scoreboard is a *timing-model* heuristic, decoupled
+from the functional value-computation engine (which uses the actual register file / memory state, not the
+scoreboard). Disabling WAR tracking should therefore be timing-only and functionally safe in this model, but this
+reasoning has not been independently confirmed by, e.g., diffing functional output/correctness checks with WAR
+disabled vs enabled. Worth a quick correctness sanity pass before treating this as a permanent config change.
+
+**Persisted**: `-scoreboard_war_mode opc` → `disabled` in `SM90_H100_l2norm_l1dnorm/gpgpusim.config` (the
+"current best" config used throughout this investigation). The unmodified base `SM90_H100/gpgpusim.config` was
+left at `opc` since it's meant to stay a clean reference config.
+
+**Correctness sanity check — CONFIRMED SAFE.** Two angles:
+
+1. *Architectural*: traced memory addresses/operands come directly from the NVBit-recorded trace
+   (`trace_driven.cc:367`, `set_addr(i, trace.memadd_info[0]->addrs[i])`) — pre-computed on real hardware, not
+   recomputed by any in-simulator functional/ALU engine. The scoreboard (WAR or RAW) only gates *when* an
+   instruction is allowed to issue; it has no path to influence *what* address or operand value an instruction
+   uses. In this trace-driven model there is no mechanism by which disabling WAR tracking could corrupt a value
+   — it can only change cycle counts.
+2. *Empirical*, diffing `k3_l2norm_all_traces_v2.log` (baseline, `opc`) vs `k3_war_disabled.log` (isolated,
+   `disabled`):
+
+   | Check | Baseline (`opc`) | WAR disabled | Verdict |
+   |---|---|---|---|
+   | `gpu_sim_insn`/`gpu_tot_sim_insn` (thread-instructions) | 8,333,696 | 8,333,696 | identical |
+   | `gpgpu_n_tot_w_icount` (warp-instructions committed) | 260,792 | 260,792 | identical |
+   | Core-level `GLOBAL_ACC_W`/`TEXTURE_ACC_R` issued | 2,048 / 24,928 | 2,048 / 24,928 | identical |
+   | Total DRAM reads / writes | 67,360 / 0 | 67,360 / 0 | identical |
+   | Deadlock detector / assertions / errors | none fired | none fired | both completed cleanly |
+   | L2-level access count, icnt packets | 8441 / 35,828 | 8447 / 35,852 (+0.07%) | tiny, expected cache-timing shift, not corruption |
+
+   Every functional invariant (instruction counts, memory accesses, DRAM traffic, clean completion with no
+   deadlock) is byte-identical between the two runs; the only differences are in cache/interconnect counters
+   that legitimately shift with issue timing. Treated as confirmed safe — `-scoreboard_war_mode disabled` is a
+   pure timing-model change with no functional-correctness risk in this trace-driven simulator.
+
+**Still not done**: investigating *why* WAR hazards are so common in this kernel specifically (mmq's inner loop
+reuses register-allocated accumulator/operand slots heavily across unrolled iterations — a plausible source, not
+yet confirmed by reading the generated SASS).
+
+### 23.16 Re-tested IMMA init/dependent-latency decouple on the WAR-disabled config — still no improvement
+
+Re-ran the already-built `-tensor_initiation_cycles_override 2 -tensor_dependent_latency_override 24` override
+(real H100 ubench numbers, §1.1) on top of today's WAR-disabled best config, to see if the interaction changed now
+that WAR stalls no longer dominate:
+
+| Config | Cycles | Δ vs WAR-disabled-only |
+|---|---|---|
+| Isolated, WAR disabled only (185,573) | 185,573 | — |
+| Isolated, WAR disabled + IMMA decouple (`k3_isolated_war_off_imma_decouple.log`) | **186,770** | **+0.65% (worse)** |
+
+Same conclusion as the original §1.1 test on the old sectored-L2 baseline (then: −0.11%, negligible) — decoupling
+the IMMA initiation/dependent-latency split toward the real ubench numbers does not help, and now actually
+regresses slightly. Not pursued further at full-chip scale (isolated result was already unfavorable). The IMMA
+formula split is not on today's critical path; ruled out a second time, on a different baseline.
+
+### 23.17 SECOND POSITIVE LEVER: a real register bypass/forwarding network — new feature, built and validated
+
+Acted on guess #3 from §23.14's list (no bypass/forwarding network was modeled at all — confirmed via grep, zero
+bypass logic in `subcore.cc`). Built a real, scoped microarchitecture feature rather than a config-only test:
+
+**Design** (`-is_register_bypass_forwarding_enabled`, `-register_bypass_window_cycles` default 2,
+`-register_bypass_ports_per_subcore` default 1): when an instruction with destination registers leaves EX
+(`functional_unit::instruction_finishing_execution`, the same hook `maybe_release_scoreboard_at_ex` already uses),
+`SM::maybe_record_register_bypass()` marks each destination register as forwardable for `window_cycles`, in a new
+per-warp table on `Scoreboard` (`m_bypass_forward_table`) — **without** releasing the real scoreboard claim, so
+WAW ordering and full RF-writeback timing stay untouched. At issue time
+(`Scoreboard::checkCollision_remodeling_with_bypass`, called from `subcore.cc`'s issue loop in place of the plain
+`checkCollision_remodeling` when the flag is on), a scoreboard collision on one of the *consumer's own destination
+registers* (WAW) always still blocks — never bypass-eligible. A collision on a *source operand* (true RAW) can
+instead be satisfied by the bypass network if a forwarded write for that exact register is still within its
+window and a bypass port is still free for that subcore this cycle (tracked per-subcore, reset every cycle).
+
+**Results** (window=2, ports=1 — the defaults, chosen as a conservative/minimal first cut):
+
+| Config | Cycles | Δ |
+|---|---|---|
+| Isolated, WAR disabled only | 185,573 | — |
+| Isolated, WAR disabled + bypass network (`k3_isolated_bypass_w2p1.log`) | **184,904** | **−0.36%** |
+| Full-chip, WAR disabled only | 210,062 | — |
+| Full-chip, WAR disabled + bypass network (`k3_fullchip_bypass_w2p1.log`) | **208,650** | **−0.67%** |
+
+Smaller than the WAR fix, but real, positive, and — unusually — *larger* proportionally at full-chip scale than in
+isolation (−0.67% vs −0.36%), the opposite of the IMMA-decouple result. Instruction counts identical in both
+full-chip runs (`gpu_sim_insn=1,170,378,752`, `gpgpu_n_tot_w_icount=36,715,744`) — functionally clean, no
+correctness concern, consistent with the design (bypass only ever *shortcuts* a wait, never skips real ordering).
+
+**Cumulative progress vs real H100** (166,246 cycles): 216,392 (L2-normal baseline, +30.2%) → 210,062 (+ WAR
+disabled, +26.35%) → **208,650 (+ bypass network, +25.51%)**.
+
+### 23.18 Bypass network window/port sweep — non-monotonic, window=4/ports=1 is the sweet spot
+
+Re-profiled the new best config (`-subcore_issue_debug 1` on WAR-disabled + bypass w2p1, isolated): **SP_OP/scoreboard
+is still the #1 stall reason** by a wide margin (44.2% of all 152,869 stall events, 67,559 events) — the narrow
+2-cycle/1-port bypass only shaved a fraction of it. New secondary finding: `LOAD_OP/cta_barrier` (12.2%) and
+`SFU_OP/cta_barrier` (11.3%) now rank #2/#3 by *stall-event count* — not necessarily by time-share (§23.5's
+cycle-time-based barrier analysis found only ~4.86% of total time is barrier-bound; event-count share and
+time-share are different metrics, not yet reconciled).
+
+Swept `register_bypass_window_cycles`/`register_bypass_ports_per_subcore` (isolated, 1-SM/1-CTA):
+
+| Window | Ports | Cycles | Δ vs WAR-disabled-only (185,573) |
+|---|---|---|---|
+| 2 | 1 | 184,904 | −0.36% |
+| **4** | **1** | **184,384** | **−0.64% (best found)** |
+| 2 | 2 | 184,904 | −0.36% (identical to 2/1 — extra port unused at this window) |
+| 4 | 2 | 184,624 | −0.51% |
+| 8 | 2 | 184,730 | −0.45% |
+| 16 | 4 | 185,339 | −0.13% (worse than even the narrowest 2/1 case) |
+
+**Non-monotonic** — widening past window=4 makes things *worse*, not better, and 16/4 nearly erases the whole
+gain. Likely a second-order scheduling effect: shortening more RAW waits shifts which warp the
+greedy-then-highest-id priority order picks each cycle, which can ripple into worse downstream decisions
+elsewhere (the same kind of sensitivity already seen in the scheduler-policy A/B tests, §23.3). Not a sign of a
+bug in the bypass logic itself — confirms this issue scheduler is generally sensitive to small timing
+perturbations in non-obvious ways.
+
+**Full-chip validation of window=4/ports=1** (`k3_fullchip_bypass_w4p1.log`): **208,191 cycles** — a further
+−0.22% vs the window=2/ports=1 full-chip result (208,650), tracking the isolated improvement's direction.
+Instruction counts identical to every other full-chip run this session (`gpu_sim_insn=1,170,378,752`,
+`gpgpu_n_tot_w_icount=36,715,744`) — functionally clean.
+
+**Cumulative progress vs real H100, updated**: 216,392 (L2-normal baseline, +30.2%) → 210,062 (+ WAR disabled,
++26.35%) → 208,650 (+ bypass w2/p1, +25.51%) → **208,191 (+ bypass w4/p1, +25.23%)**.
+
+**Window=4/ports=1 persisted** to `SM90_H100_l2norm_l1dnorm/gpgpusim.config`
+(`-is_register_bypass_forwarding_enabled 1 -register_bypass_window_cycles 4 -register_bypass_ports_per_subcore 1`).
+
+### 23.19 Re-profile on the new best config, and a `cta_barrier` red herring resolved
+
+Re-ran `-subcore_issue_debug 1` on today's persisted best config (isolated, 184,384 cyc). Stall-event mix barely
+moved from §23.14's earlier snapshot: total stall events 152,869→148,231 (−3.0%), but `SP_OP/scoreboard` stayed at
+**the same ~44.3% share** (65,607 events) — the bypass network only reaches RAW pairs within its 4-cycle window;
+the bulk of `SP_OP/scoreboard` stalls are genuine longer-distance dependency chains a forwarding network
+structurally can't shorten (real compute latency elapsing, not a register-file round-trip tax — consistent with
+§23.9's earlier finding that SP_OP's raw 4-cycle EX latency is already realistic).
+
+New apparent lead: `LOAD_OP/cta_barrier` + `SFU_OP/cta_barrier` + `BRANCH_OP/cta_barrier` together are 23% of all
+stall *events*, and ~99% of those are tagged "starved" (literally nothing else issuable that cycle) — looked
+promising. **Dug in and it's a red herring, already settled by §23.5.**
+
+`issue_debug_barrier_kind()`/`is_warp_blocked_by_programmer_barrier_for_issue()` (`subcore.cc:223-266`) confirm
+`cta_barrier` = `sm->warp_waiting_at_barrier()` — exactly the same arrival→release window §23.5 already measured
+via `[bar_arrival_trace]`. Re-ran §23.5's exact method on today's config (61 barrier instances, pairing every 8
+consecutive `[bar_arrival_trace]` lines, summing `max_arrival − own_arrival` per warp):
+
+- **71,692 total idle warp-cycles** → `71,692 / (8 × 184,384) = 4.86%` of total time — **identical to the original
+  §23.5 measurement**, unchanged by today's WAR-disable/bypass fixes.
+- Reconciles the apparent event-count/time-cost mismatch: 37,135 `cta_barrier` stall *events* is only ≈52% of the
+  71,692 true idle warp-cycles — the event log *under*-counts real barrier idle time (a barrier-waiting warp's
+  IBuffer entry often isn't even valid/fetched yet for much of its wait, so there's nothing to classify that
+  cycle), it doesn't exaggerate it. The near-100% "starved" tag on events that *do* get recorded just confirms
+  that whenever a barrier stall is visible in the log, the whole subcore genuinely had nothing else to do.
+
+**Verdict**: barriers remain a small, ~4.86%-of-time cost, exactly as §23.5 found — not a meaningful lever despite
+the misleadingly large stall-event share. Re-confirms `SP_OP/scoreboard`'s genuine longer-distance RAW chains as
+the one real remaining thread (the L2/DRAM miss-latency excess flagged as the other thread is closed out next,
+§23.20 — it turns out to no longer exist on the current config).
+
+### 23.20 CLOSED: the "L2/DRAM miss-latency excess" was stale, and no longer exists on the current config
+
+Dug into the §1/§4/§9-item-7 "miss latency excess" (simulated avg miss latency 658.83 cyc vs real DRAM RTT
+478-495 cyc, an apparent +170-190 cyc excess) that this document's earlier sessions had flagged as "important, not
+a simple fix" and an open thread. Two findings close it out for good:
+
+1. **The 658.83 cyc figure is stale and unreproducible.** `grep -rn "avg_miss_latency\|avg_hit_latency"` across the
+   entire `gpgpu-sim/src/` tree returns **zero matches** — this stat doesn't exist anywhere in the current
+   codebase. It must have come from older/temporary instrumentation, not anything still present. (The notes had
+   already self-corrected this once before, in §12.3 of an earlier session: re-measured on the `best_optA`
+   baseline and found the real gap was only +7%, not +38% — but even that re-measurement predates this session's
+   L2-normal/WAR-disable/bypass fixes and is itself now outdated.)
+2. **Fresh measurement on today's actual best config**, using the real per-request `[mem_request_trace]`
+   instrumentation (`k3_isolated_newbest_memtrace.log`, 8,420 DRAM-bound requests captured, isolated 1-SM/1-CTA):
+   avg DRAM round-trip (`send`→`resp`) = **242 cyc**, of which 235 cyc is the DRAM-subsystem span itself
+   (`dram_enter`→`dram_exit`) and only ~7 cyc combined is pre/post overhead. **This is nearly 2x faster than real
+   H100's measured 478-495 cyc DRAM RTT, not slower.**
+
+**Verdict: this thread is closed, not just deprioritized.** There is no miss-latency excess left to fix on the
+current config — if anything, the L2-normal simplification (§20.2/§22, a deliberate working choice, not a
+claimed production-accurate setting) has overshot past real DRAM latency in the *fast* direction. Memory latency
+is conclusively **not** a contributor to the remaining +25.23% gap; the gap is entirely on the compute/issue side
+(`SP_OP/scoreboard`'s genuine longer-distance RAW chains, confirmed in §23.19, is the one real remaining thread).
+
+**Side change, also new this session**: the SM0 commit-progress heartbeat (`[commit_progress] sm=0
+committed_insts=... cycle=...`, originally added behind `-subcore_issue_debug` and firing every 1,000
+instructions) is now **always on** regardless of `-subcore_issue_debug`, and the interval was changed to every
+**10,000** instructions (`sm.cc`, `instruction_retirement()`). This exists purely so long full-chip runs always
+show liveness/progress in the log without needing the (expensive) full debug-trace flag.
+
+### 23.21 CLOSED: subcores are single-issue by hard structural design — not a lever, and it matches real H100
+
+With `SP_OP/scoreboard`'s longer-distance RAW chains confirmed as the one real remaining thread (§23.19/§23.20),
+checked whether dual-issue (one subcore issuing >1 instruction/cycle to different pipes simultaneously) was even
+architecturally possible in this model, as a way to hide those RAW waits with otherwise-independent work. It is
+not, and that's correct, not a gap to fix:
+
+1. `Subcore::cycle()` (`subcore.cc:605-616`) calls `issue(m_sm)` **exactly once per subcore per cycle** — a single
+   call site, no loop over multiple issue attempts.
+2. Inside `issue()`, the priority-ordered warp scan `break`s immediately after the first successful issue
+   (`subcore.cc:1108`) — but even without that `break`, there's nowhere for a second instruction to go that
+   cycle: `m_ISSUE_CONTROL_latch = register_set_uniptr(1, "ISSUE_CONTROL_latch")` (`subcore.h:131`) is a
+   **single-slot** pipeline register. Every other pipeline latch in this design
+   (`m_CONTROL_ALLOCATE_latch`, `m_EX_WB_sm_shared_units_latch`, `m_read_stage_aux_latch`, etc.) is likewise
+   explicitly sized `1` — single-issue is structural, baked into the pipeline register width throughout, not an
+   incidental loop-control artifact.
+
+**Why this isn't a bug to fix**: real Hopper SMs are divided into 4 sub-partitions, each with its own warp
+scheduler issuing exactly **1 instruction per cycle** to its private execution pipes — NVIDIA's documented SM
+microarchitecture since Volta/Turing (unlike much older architectures with limited dual-issue in some cases).
+This model's single-issue-per-subcore is architecturally **correct** for H100, not a simplification costing us
+cycles relative to real hardware. **Ruled out as a lever** — no dual-issue headroom exists to recover here.
+
+### 23.22 CONCLUSIVE: the real SASS schedule is already near-optimal — the gap is the simulator's SP_OP latency model, not the kernel's code
+
+Checked whether k3's compiled SASS itself has unexploited ILP that a better instruction ordering could expose
+(i.e. is the `SP_OP/scoreboard` bottleneck a property of the kernel's actual code, or of how our simulator models
+it). Two approaches:
+
+1. **False lead, caught and discarded**: tried to read this directly off our own trace's `control_bits` field
+   (`stall_count`/`wait_barrier_bits`, captured per-instruction in `extra_info/enhanced_execution_info.json`).
+   Found all 6,352 of k3's static instructions report `stall_count=0`/`wait_barrier_bits=0` uniformly — including
+   memory loads, which on real Volta+ hardware *always* need a wait-barrier (load latency is variable, can't use
+   a static stall count). That uniform all-zero pattern is the tell: confirmed via
+   `grep -rn "stall_count\|control_bits\|wait_barrier" util/tracer_nvbit/tracer_tool/tracer_tool.cu` → **zero
+   matches** — this fork's tracer never actually populates `control_bits` from the real SASS control words. The
+   field exists in the schema but is dead/unwired. Caught before reporting it as a finding.
+2. **Real measurement**: extracted the actual compiled SASS via `cuobjdump --dump-sass --gpu-architecture sm_90`
+   on the real `libggml-cuda.so` (function `_Z9mul_mat_qIL9ggml_type8ELi128ELb0EEv...`, the exact traced k3
+   kernel), then decoded the genuine Volta+/Hopper control-word encoding (stall count, yield, write/read barrier
+   index, wait-barrier mask — bits 41-57 of each instruction's second 64-bit hex word) with a purpose-built
+   decoder. Validated the decode is correct via a self-consistency check: a `MUFU.RCP` (variable-latency SFU op)
+   sets `wrtbar=1`, and the next dependent instruction shows `waitmask` with bit 1 set — exactly the real-hardware
+   barrier-handshake pattern, not something a wrong bit-offset would produce by chance.
+
+**Result, on the dequant-accumulate chain that IS the kernel's `SP_OP` bottleneck** (`FFMA.FTZ`/`FMUL.FTZ`/
+`I2FP.F32.S32`, 1,024 instances each — converts the `IMMA` tensor-core integer accumulator to scaled float and
+accumulates into the output, 1,536 total instructions sampled):
+
+- **Average stall = 1.245 cycles, 96.7% of instances at stall ≤ 2.** `IMMA` itself: 86% at stall=1.
+- The only high-stall-count code in the whole kernel (stall=4/5/13) is the address-computation/software-emulated
+  integer-division preamble — not the hot accumulation loop.
+
+**Verdict**: `ptxas` already achieved near back-to-back issue for this exact instruction sequence on real
+hardware — there is no missing ILP for a better instruction ordering to expose; restructuring the SASS is not a
+viable lever (and not something achievable within this investigation's scope anyway — it would mean a different
+question, asked of ggml's CUDA kernel authors, not us). **This reframes the whole remaining gap**: our simulator
+runs this *exact same instruction sequence* (same trace, same register dependencies) but classifies 44% of all
+stall events as `SP_OP/scoreboard` (§23.19) — meaning the simulator is inserting far more waiting for this code
+than real hardware's own compiler-validated schedule requires. The bottleneck is that this model's SP_OP
+dependent-latency (4-cycle EX latency + scoreboard-release timing, even after the §23.17-23.18 bypass-network
+fix) is structurally more conservative than what real Hopper's deeply-pipelined FP32 ALU + compiler-driven static
+scheduling actually sustains for this code (~1.2-cycle effective dependent latency, not 4+). The path to closing
+more of the remaining +25.23% gap is narrowing this model's SP_OP-class dependent latency, not touching the
+kernel's code.
+
+### 23.22b Refinement: `SP_OP/scoreboard` is a MIX — one part over-modeled, one part a genuine real-HW cost
+
+Followed up §23.22 by checking which actual instructions occupy the hottest `SP_OP` PCs in the dynamic trace
+(every SP_OP PC for warp 0 commits exactly 15 times — once per K-loop round, confirming these are loop-carried,
+not unrolled-independent). Cross-referenced against the static instruction JSON
+(`extra_info/enhanced_execution_info.json`, `unique_function_id=34`): the hottest PCs are **not** the FFMA
+dequant-accumulate epilogue from §23.22 — they're `IMAD.WIDE` **address-computation** instructions, the K-loop's
+per-round load-address pointer-increment chain (e.g. `f750: IMAD.WIDE R46,R15,0x22,R44` → `f7a0: IMAD.WIDE
+R48,R15,0x22,R46`, an explicit induction-variable RAW chain on the address registers, repeating once per round).
+
+Checked these exact PCs in the real decoded SASS (`k3_sass_decoded.txt`): **`stall=3` and `waitmask=000001` on
+nearly every one** — unlike the FFMA chain (no wait-barrier usage at all), these *do* use the dynamic wait-barrier
+mechanism on real hardware. Reading the surrounding code explains why: the same address register (e.g. `R46`) is
+used as a load address by an `LDG.E.U16.CONSTANT` a few instructions earlier (`f530: LDG ... [R46.64+0x4]`), then
+overwritten by the next round's `IMAD.WIDE` (`f590: IMAD.WIDE R46,R15,0x22,R6`) — **a WAR hazard on the address
+register itself**: the new address write must wait until the earlier load finishes reading the old value. Real
+hardware genuinely respects this with a wait-barrier (load completion time is unpredictable, a static stall count
+can't cover it) — a real, necessary cost, not simulator over-conservatism.
+
+**This refines §23.22, doesn't overturn it.** `SP_OP/scoreboard` is a mix of (at least) two different things:
+1. FFMA/FMUL/I2FP dequant-accumulate epilogue — real hardware pays almost nothing (avg stall=1.245, §23.22) —
+   genuinely an area where this simulator's dynamic scoreboard is more conservative than real hardware needs.
+2. `IMAD.WIDE` address-recomputation chain (this section) — real hardware *does* pay a real, comparable cost
+   (`stall=3` + wait-barrier, roughly the same ballpark as this model's ~4-cycle EX latency + scoreboard wait) —
+   a genuine, hardware-confirmed WAR dependency, not a modeling gap to chase further.
+
+**Net effect**: there is real headroom in #1, but #2 is likely already about as good as it can get without a
+real change to the kernel's address-computation strategy (e.g. fewer/cheaper induction-variable updates per round
+— an upstream ggml-cuda code question, out of scope here).
+
+### 23.24 Per-PC stall attribution built, and it conclusively resolves #1 vs #2 in favor of #1
+
+Built `-subcore_issue_debug 1`'s new `[pc_stall_stats]` output: a per-static-PC stall histogram (mirrors the
+existing per-op-type one, see `PcStallHistogramState`/`pc_stall_histogram_record`/`_print_body` in `subcore.cc`),
+recorded at the same two call sites as the existing op-type histogram, printed sorted by stall count descending.
+This directly answers which *exact instructions* the §23.22b mix is actually made of, rather than inferring it
+from occurrence counts (which is what led §23.22b toward the wrong instruction class — occurrence count picks out
+whichever PCs simply execute most often, not whichever ones actually generate the most *stall* time).
+
+**Result, top SP_OP-classified PCs by stall count** (isolated best config, `k3_pc_stall_stats.log`):
+
+| pc | static instruction | our sim stall events | real SASS stall | real waitmask |
+|---|---|---|---|---|
+| 0xdb70 | `IMAD R4, R5, R4, RZ` | **4,474** (by far the largest single PC) | 4 | `000010` (real barrier wait) |
+| 0x10e30 | `FMUL.FTZ R49, R59, R48` | 1,243 | 1 | none |
+| 0x13220 | `FMUL.FTZ R50, R46, R97` | 900 | 2 | none |
+| 0x12b00 | `FMUL.FTZ R48, R58, R49` | 840 | 1 | none |
+| 0x11920 | `FMUL.FTZ R115, R56, R115` | 720 | 1 | none |
+| (14 more FFMA/FMUL PCs) | — | 540-690 each | 1-3 | none |
+
+Classified all 43 SP_OP PCs visible in the top-60 printed rows (covering 27,027 of the bucket's 78,893 total
+stall events) against the static instruction JSON: **41 of 43 are `FFMA.FTZ`/`FMUL.FTZ`; only 2 are
+`IMAD`/`IMAD.WIDE`.** This conclusively resolves the §23.22b open question: **the dequant-accumulate epilogue
+(#1) dominates the `SP_OP/scoreboard` stall bucket by every PC that matters except the single `0xdb70` outlier**
+(which genuinely does have a real-hardware wait-barrier, i.e. is a legitimate cost, not over-modeling). §23.22b's
+IMAD.WIDE address-chain hypothesis doesn't even appear in the top-stalling PCs — it was a red herring produced by
+looking at raw occurrence counts rather than actual stall attribution.
+
+**Net conclusion for this whole investigation thread**: the dominant remaining lever, if pursued further, is
+narrowing this simulator's SP_OP dependent-latency model specifically for the FFMA/FMUL dequant-accumulate
+pattern — real hardware pays almost nothing for it (confirmed twice now: §23.22's aggregate average and this
+section's PC-exact cross-check), our simulator pays the most of anything in the kernel for it. Not implemented
+this session (would mean changing the 4-cycle EX latency or the scoreboard-release timing specifically for this
+op pattern, a more invasive change than the bounded, reversible fixes already shipped today).
+
+**Code change**: `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc` — `PcStallHistogramState` struct +
+`pc_stall_histogram_record()`/`pc_stall_histogram_print_body()` (mirrors the existing per-op-type histogram),
+wired into the same two call sites as `issue_stall_histogram_record()` and the same two print sites as
+`issue_stall_histogram_print_body()`/`starvation_histogram_print_body()`. Gated by the existing
+`-subcore_issue_debug 1` flag, no new CLI flag needed. Output: `[pc_stall_stats]`, sorted by stall count
+descending, top 60 PCs, each showing op type, total stall count, issued count, and a reason breakdown.
+
+### 23.25 FOURTH LEVER, small: early-forward bypass path for SP_OP only (real H100's ~1.2-cycle effective dependent latency)
+
+Acted on §23.24's identified next step: narrow the SP_OP dependent-latency model specifically for the FFMA/FMUL
+dequant-accumulate pattern. Tried reducing `-ptx_opcode_latency_fp`'s MUL/MAD entries directly first — already
+known to be a dead end (`lat=3` vs `lat=4` was byte-identical, confirmed earlier this session, §23.16's
+neighborhood) — so didn't repeat that. Instead built a real, scoped microarchitecture extension to the existing
+bypass network (§23.17): a second "early-forward" recording path, specifically for `SP__OP` (FP32 ADD/MUL/MAD)
+only, that marks an instruction's destination registers forwardable **at dispatch into the FU** (the moment it
+leaves the issue stage), rather than waiting for the existing path's EX-finish trigger. The existing late path
+forwards only *after* the full EX latency elapses — useless for closing the literal 4-cycle RAW wait itself, only
+the EX-finish-to-WB tail (which is all §23.17-23.18 could ever target). This new path can shorten the wait itself.
+
+**Design**: `Scoreboard::recordBypassWrite()` gained an optional `valid_from_cycle` parameter (default 0 = always
+valid, preserving the old call site's behavior exactly); `m_bypass_forward_table`'s value type changed from a
+single `expire_cycle` to a `{valid_from_cycle, expire_cycle}` pair, and the bypass-availability check in
+`checkCollision_remodeling_with_bypass` now requires `cur_cycle` to be within both bounds.
+`SM::maybe_record_register_bypass_early()` (new, `sm.cc`) is called from `functional_unit::issue()` at dispatch
+time, gated on `op_pipe == SP__OP`; it records `valid_from = dispatch_cycle + register_early_forward_delay_cycles`,
+`expire = valid_from + register_bypass_window_cycles` (reuses the existing window setting). New flags:
+`-register_early_forward_sp_op_enabled` (default 0/off), `-register_early_forward_delay_cycles` (default 1).
+
+**Swept `register_early_forward_delay_cycles` × `register_bypass_ports_per_subcore`** (isolated 1-SM/1-CTA, on top
+of the persisted window=4/ports=1 best config):
+
+| Delay | Ports | Cycles | Δ vs 184,384 baseline |
+|---|---|---|---|
+| 1 | 1 | 185,087 | **+0.38% (worse)** |
+| 2 | 1 | 184,285 | −0.054% |
+| **3** | **1** | 184,242 | −0.077% |
+| 4 | 1 | — (not separately run, ≈baseline expected) | — |
+| 1 | 2 | 184,683 | still worse than baseline |
+| 2 | 2 | 184,592 | −0.054% |
+| **3** | **2** | **184,130** | **−0.138% (best found)** |
+| 3 | 4 / 8 | 184,130 (identical) | saturates at ports=2 |
+| 4 | 2 | 184,624 | worse than delay=3 |
+
+Non-monotonic in both knobs, same as §23.18's bypass-window sweep — delay=1 actively hurts (more bypass attempts
+contend for the single port per subcore per cycle, perturbing which warp the greedy scheduler picks that cycle,
+the same second-order sensitivity already documented). delay=3/ports=2 is the local optimum; saturates beyond
+ports=2 (no further gain at 4 or 8), confirming it's not simply port-starved at that point.
+
+**Full-chip validation** (`k3_fullchip_early_forward_d3p2.log`, `-register_early_forward_sp_op_enabled 1
+-register_early_forward_delay_cycles 3 -register_bypass_ports_per_subcore 2`): **208,119 cycles** vs the
+208,191-cycle baseline (−0.035%). Instruction counts identical to every other full-chip run this session
+(`gpu_sim_insn=1,170,378,752`, `gpgpu_n_tot_w_icount=36,715,744`) — functionally clean, no correctness concern.
+
+**Cumulative progress vs real H100, updated**: 216,392 (L2-normal baseline, +30.2%) → 210,062 (+WAR disabled,
++26.35%) → 208,650 (+bypass w2/p1, +25.51%) → 208,191 (+bypass w4/p1, +25.23%) → **208,119 (+early-forward
+d3/p2, +25.19%)**.
+
+**Honest assessment**: real, validated, correctness-clean — but small (0.035% full-chip), much smaller than the
+isolated test suggested (−0.138%), the same isolated-vs-full-chip damping pattern seen with the original bypass
+network's window/port sweep. The scheduler-sensitivity ceiling documented since §23.3/§23.18 appears to be the
+real limiter here, not bypass-port or window capacity (saturates at ports=2) — pushing this lever further (e.g.
+extending early-forward to other op-pipe classes) is likely to keep hitting the same wall rather than compound.
+**Persisted** to `SM90_H100_l2norm_l1dnorm/gpgpusim.config`: `-register_bypass_ports_per_subcore` raised 1→2,
+plus the two new flags (`-register_early_forward_sp_op_enabled 1 -register_early_forward_delay_cycles 3`).
+
+**Code change**: `scoreboard.h`/`scoreboard.cc` (`recordBypassWrite` gains `valid_from_cycle`, bypass table value
+type becomes a pair), `sm.h`/`sm.cc` (`maybe_record_register_bypass_early`), `functional_unit.cc` (call site in
+`issue()`), `shader.h`/`gpu-sim.cc` (two new CLI flags).
+
+### 23.26 Per-instruction `[commit_trace]` duration confirms §23.23's write-epilogue contention at the instruction level
+
+User asked why specific `STORE_OP` commits in `k3_all_debug.log` took 600-700+ cycles from issue to commit (e.g.
+`pc=0x181c0 issue_cycle=183159 commit_cycle=183800`, duration 641). Two things done:
+
+1. **Added a `duration` field directly to `[commit_trace]`** (`sm.cc::instruction_retirement`) — was previously
+   issue_cycle/commit_cycle only, requiring manual subtraction. Now prints `duration=<commit-issue>` inline.
+2. **Checked what these specific slow commits actually are.** Cross-referenced the hot PCs against the static
+   instruction JSON: `pc=0x181c0` etc. (the example in the question) are `STG.E desc[UR10][R6.64+0x20] R174` —
+   **the global output epilogue writes**, exactly the `GLOBAL_ACC_W` writes already quantified in §23.23's
+   `RESERVATION_FAIL`-based analysis. Computed the full duration distribution for all 9,160 `STORE_OP` commits in
+   the run: **p50=40 cyc, p90=99 cyc, but p99=616 cyc** — a sharp bimodal split. Binning by cycle confirms it:
+   75% of all >200-cycle-duration stores (420 of 559) land in the 180,000-190,000 cycle bucket, i.e. the kernel's
+   final ~4,000 cycles — the simultaneous 8-warp output burst at kernel end, same mechanism §23.23 already found
+   via aggregate `RESERVATION_FAIL` counts (6,345 fails / 2,048 successful writes). This is the per-instruction,
+   ground-truth confirmation of that same finding, not a new cost.
+3. **Smaller, separate observation**: a handful of `STORE_OP` commits scattered throughout the *middle* of the
+   kernel (8-22 per 10k-cycle bucket, much rarer than the end-of-kernel spike) also show 200-700+ cycle durations.
+   Checked their PCs: these are `STS` (shared-memory stores, e.g. `pc=0xfb00: STS [R20+0x4a00], R55`) — the
+   K-loop's IMMA-result shared-memory staging, a structurally different contention path (shared-memory port/bank
+   pressure, not the L1D `RESERVATION_FAIL` mechanism §23.23 measured for global stores). Not investigated further
+   this session — much smaller magnitude (a few dozen instances total vs. hundreds at the epilogue), and a
+   different resource than the one §23.23 already quantified.
+
+### 23.27 RULED OUT: decoupling fetch priority from issue priority makes things worse, not better
+
+Direct follow-up to §23.2's addendum (warp1 starved on fetch for 68 cycles by its subcore-mate warp5 monopolizing
+the shared fetch port). Asked: if fetch alternated independently instead of being re-synced to the issue
+priority pointer every cycle (`Subcore::cycle()`: `m_greedy_pointer_fetch = m_greedy_pointer_issue;`), would that
+help? Built and tested it rather than guessing.
+
+**Design**: new flag `-is_subcore_fetch_round_robin_independent` (default 0/off, preserves exact baseline
+behavior). When enabled: `Subcore::cycle()` skips the fetch-pointer resync; instead `Subcore::fetch()` advances
+`m_greedy_pointer_fetch` to `(subcore_warp_id+1) % num_warps` round-robin after every fetch attempt, independent
+of whatever the issue scheduler is doing. Issue itself is untouched — still greedy-then-highest-id, still rides
+the same warp until it stalls.
+
+**Result** (isolated 1-SM/1-CTA, on top of the persisted best config): **184,775 cycles vs 184,130 baseline
+(+0.35%, worse)**. `gpu_sim_insn` identical (8,333,696) — correctness-clean, just slower.
+
+**Verdict**: ruled out, same lesson as §23.3's true-round-robin-issue test (+3.6% worse) and consistent with the
+broader theme this session (§23.18, §23.25) that this scheduler's greedy "stick with whoever's making progress"
+coupling is net beneficial despite causing visible, real, individually-diagnosable starvation in specific spots.
+Un-starving the losing warp costs more (in lost momentum for the warp that *was* making progress) than it
+recovers. Not persisted; flag left available (default off) for any future, more targeted variant (e.g. only
+decouple when the greedy warp's own IBuffer is near-full, rather than every cycle unconditionally).
+
+**Code change**: `shader.h`/`gpu-sim.cc` (new flag), `subcore.cc` (`Subcore::cycle()` conditional resync skip,
+`Subcore::fetch()` independent round-robin advance after the existing per-cycle fetch attempt's `break`).
+
+### 23.28 `[commit_trace]` gained live operand annotation + duration field; bulk duration-distribution sanity check
+
+Two small, purely-observational additions to `sm.cc::instruction_retirement`'s `[commit_trace]` print (no cycle-
+count change, validated: 184,130 isolated, instruction counts unchanged):
+1. **`duration=<commit_cycle-issue_cycle>`** field, computed inline.
+2. **`opcode=...` / `operands=[...]`** fields, pulled live from `get_extra_trace_instruction_info()` (the same
+   static per-instruction info `checkCollision_remodeling_with_bypass`/the bypass network already use at issue
+   time) — each operand tagged `(dst)`/`(src)` by index vs `get_num_destination_registers()`. No new guard
+   needed beyond the existing `-subcore_issue_debug` gate; earlier attempt mistakenly gated this on
+   `is_captured_from_binary` (which actually means "has real SASS control-bits," confirmed false/unused for this
+   trace per §23.22's first finding) and printed empty fields until that guard was removed.
+
+**Built `log/tmp_log/analyze_commit_trace.py`** to bulk-check whether the resulting per-instruction durations are
+behaving the way they should — i.e. fixed for ALU pipes, and *properly dynamic* (cache-hit vs DRAM-miss bimodal)
+for memory ops — rather than spot-checking a handful of lines. Run against an isolated single-SM/single-CTA
+`-subcore_issue_debug 1` capture (`k3_commit_trace_annotated2_subcore0.log`, SM0/subcore0 only, 65,198 lines
+parsed):
+
+**Compute pipes — correctly near-static, as they should be (fixed-latency units, no data-dependent timing):**
+
+| op | opcodes | distinct durations | range |
+|---|---|---|---|
+| `SP_OP` | `FFMA.FTZ`, `FMUL.FTZ`, `IMAD*` | 1-2 | 10 (occasionally 11) |
+| `INTP_OP` | `IADD3`, `LEA`, `PRMT`, etc. | 1 each | fixed per opcode (10, or 19 for `ISETP.*`) |
+| `UNIFORM_OP` | `UIMAD`, `UIADD3`, etc. | 1 | fixed at 10 |
+| `TENSOR_CORE_OP` | `IMMA.16832.S8.S8` | **1 (exactly 14, zero variance across all 3,840 instances)** |
+| `SFU_OP` | `I2FP.F32.S32`, `MUFU.RCP` | 9 (mild) | 18-26 |
+
+`TENSOR_CORE_OP`'s perfect zero-variance is notable on its own but not new evidence of a bug — it's the same
+conclusion already reached the hard way in §23.16 (IMMA init/dependent-latency decouple tested twice, no effect):
+the tensor pipe genuinely never experiences contention in this kernel. `SFU_OP`'s mild 18-26 spread makes sense
+too — unlike the fixed-latency ALU pipes, SFU is a queued unit (`is_fixed_latency_unit()` false), so it can show
+real queueing delay when multiple warps' conversions compete for it.
+
+**Memory ops — strongly, *appropriately* bimodal (this is what should happen with a real cache hierarchy):**
+
+| opcode | n | p50 | mean | distribution |
+|---|---|---|---|---|
+| `LDS` (shared mem load) | 3,840 | 22 | 27.7 | 92% in 20-50 cyc (hit), long tail to 184 (bank-conflict/contention) |
+| `LDG.E.U16.CONSTANT` (global, dequant-scale table) | 2,040 | 342 | 357.2 | **zero instances under 200 cyc** — every single one takes the long DRAM-class path |
+| `LDG.E.CONSTANT` | 1,080 | 380 | 380.2 | same pattern, ~95% in 300-500 |
+| `LDSM.16.M88.4` (shared→tensor-core feed) | 480 | 38 | 50.0 | mostly fast, contention tail to 192 |
+| `LDC`/`LDC.64` (kernel-param constant loads) | 22 | mixed | mixed | 10/22 fast (20-50), rest at 500+ — consistent with cold first-touch per warp at kernel start, not flagged as a bug |
+| `STS` (shared mem store) | 2,162 | 39 | 52.6 | 69% in 20-50, real tail to 275 — matches §23.2's addendum (fetch/issue-port-sharing stalls between subcore-mate warps, not memory contention per se) |
+| `STG.E` (global output write) | 128 | 478 | 419.0 | **bimodal**: a handful fast (first writers), ~48% in 500+ (the simultaneous end-of-kernel burst) — direct bulk confirmation of §23.23's `RESERVATION_FAIL` finding |
+
+**Verdict: the dynamicism looks correct, not suspicious.** Every memory opcode's slow tail (300-700 cyc) lines up
+with the real DRAM round-trip class already measured directly in §23.20 (242 cyc DRAM-only span, plus realistic
+pipeline/queueing overhead to get from "DRAM responds" to "instruction commits"), and every memory opcode's fast
+cluster (20-50 cyc) matches L1D/shared-memory hit latency. The one mildly interesting observation for a future
+session, not chased further here: `LDG.E.*.CONSTANT` (the dequant-scale-table loads) **never** hit cache at all in
+this kernel — every one of 3,120 sampled instances takes the long path. Plausibly just a streamed, low-reuse
+access pattern (each output tile reads its own scale values once), but worth a second look if anyone later wants
+to check whether there's real, missed reuse across CTAs/warps that L2-normal's simplifications (§20.2/§22) are
+masking or destroying.
+
+### 23.29 Correction: prior claim about real-hardware L1D/L2 prefetching was overstated
+
+User pushed back on an earlier answer claiming real NVIDIA GPUs have no hardware data-prefetch mechanism near
+L1D/L2 "by deliberate design, to avoid competing with real traffic for bandwidth/MSHRs." That causal explanation
+was my own unsourced speculation, and the blanket "no mechanism at all" framing was wrong. Checked via web search:
+
+- A reverse-engineered **"tree-based neighborhood prefetcher"** does exist (Ganguly et al.), operating at the
+  Unified-Memory/page-migration level (2MB chunks / 64KB basic blocks) — triggered by page faults under managed
+  memory, not a per-access cache-line prefetcher for ordinary `cudaMalloc` buffers.
+- **Hopper added `cp.async.bulk.prefetch.L2`** — a real, hardware-supported PTX instruction (Compute Capability
+  9.0+) for explicitly prefetching into L2. Hardware-*assisted*, but software-*triggered* (the kernel must issue
+  it) — not an automatic, always-on stride detector.
+
+What still holds: no public evidence of a CPU-style automatic stride-predicting hardware prefetcher continuously
+watching L1D/L2 access patterns for ordinary compute kernels. For k3 specifically this doesn't change anything
+practical — it uses plain `cudaMalloc` (not managed memory, so the UVM neighborhood prefetcher is irrelevant) and
+its static opcode list (confirmed via the JSON, §23.27's analysis script and others) contains zero
+`cp.async.bulk.prefetch.*` or any other prefetch instruction. This simulator models none of these mechanisms
+either way (§ on `-is_instruction_prefetching_enabled`: instruction-cache-only, off in our config). Recorded here
+purely so a future session doesn't repeat the overstated framing as settled fact.
+
+### 23.30 Checked: is `LDG.E.*.CONSTANT` reuse actually missed across CTAs? No — it's captured at L2, just not at L1
+
+Follow-up to §23.28's flagged observation ("every `LDG.E.*.CONSTANT` load in the isolated single-CTA test takes
+the long path, zero hits"). Checked whether that's a real missed-reuse problem across the kernel's other 131
+CTAs, or an artifact of testing with only one CTA.
+
+**First, the correct classification**: `LDG.E.CONSTANT`/`LDG.E.U16.CONSTANT` (".nc"/read-only-global loads) map to
+`TEXTURE_ACC_R` in this simulator's access-type enum (`abstract_hardware_model.cc`: `tex_space` → L1TEX path),
+**not** `CONST_ACC_R` (that's the separate, small constant-bank `LDC c[0x0][...]` kernel-parameter path, which
+behaves completely differently — see below).
+
+**Full-chip cache breakdown for `TEXTURE_ACC_R`** (`k3_fullchip_early_forward_d3p2.log`, all 132 CTAs):
+
+| Level | HIT | MISS | TOTAL_ACCESS | Hit rate |
+|---|---|---|---|---|
+| L1 (per-SM, private) | 0 | 1,169,859 | 3,407,872 | **0%** |
+| L2 (chip-wide, shared) | 929,400 | 157,696 | 1,169,859 | **79.4%** |
+
+**Verdict: real reuse exists and is being captured — just at L2, not L1.** k3 launches exactly 132 CTAs, one per
+SM (confirmed: "132 bind to kernel" in the full-chip log) — so no single SM's private L1 ever sees a second CTA
+of this kernel to reuse against; 0% L1 hit is expected, not a bug. But L2 is chip-wide and shared, and 79.4% of
+`TEXTURE_ACC_R` accesses hit there — the classic GEMM weight/dequant-scale-table sharing pattern: many of the 132
+concurrently-running CTAs read overlapping regions of the quantized-weight table, and most of that reuse is
+caught by L2.
+
+**This reconciles, not contradicts, §23.28's isolated-test finding.** The isolated 1-SM/1-CTA test runs exactly
+one CTA by construction, so it can never observe L2 reuse from a sibling CTA — it was specifically measuring the
+unavoidable "first CTA to touch this address" cold-start cost, which really is ~100% of *that* test's accesses,
+without that being representative of the full kernel. In the full-chip run, CTAs 2 through 132 get to benefit
+from whichever CTA happened to touch a given address first.
+
+**Not a lever**: the remaining 20.6% L2-miss cost is the genuine, unavoidable first-touch tax spread across the
+whole kernel (someone has to be first for every address) — already getting nearly 4-in-5 reuse. No evidence of a
+real missed-reuse problem to chase here.
+
+**Method note**: used `log/tmp_log/analyze_commit_trace.py` (§23.28) plus a direct grep of
+`Total_core_cache_stats_breakdown`/`L2_cache_stats_breakdown` for the correct access-type key — the first attempt
+checked `CONST_ACC_R` (wrong access type for these PCs) before correctly identifying `TEXTURE_ACC_R` via
+`abstract_hardware_model.cc`'s `generate_mem_accesses()`/`tex_space` mapping.
+
+### 23.31 Real H100 L2 hit rate confirms §23.30's finding — strong match, not a coincidence
+
+User re-profiled the real kernel on the BSC cluster with `ncu --section MemoryWorkloadAnalysis` added (the
+command drafted together this session, with a `^mul_mat_q(?!_stream_k_fixup)` regex to exclude the unrelated
+stream-k-fixup epilogue kernel — needed because ncu's `--kernel-name regex:` appears to match against the
+*mangled* symbol, which has no literal `<` character at all; a plain `mul_mat_q<` pattern returned zero rows for
+that reason). Result: `h100_real_profile/k3_occupancy_and_l2_hitrate_filter.csv`, **498 real kernel launches**
+captured (the same compiled `mul_mat_q<Q8_0,128,false>` kernel recurs across the model's many linear layers
+during prefill — same compiled code, same launch config `(132,1,1)x(32,8,1)` every time, only the underlying
+weight-matrix data differs per call).
+
+**Real H100 `lts__t_sector_hit_rate.pct` (L2 Hit Rate) across all 498 launches**: mean=73.09%, median=79.77%,
+range 53.62%-82.51% — clearly **bimodal**, most launches cluster at ~79-82%, with a recurring smaller subset
+dropping to ~54% (visible directly in the raw per-launch sequence: `81.17, 80.58, 79.77, 81.09, 54.82, 54.4,
+78.82, ...` — a periodic dip, plausibly a specific layer-type, e.g. attention vs FFN projection, with worse
+weight-matrix reuse at that K-dimension). `l1tex__t_sector_hit_rate.pct` (L1/TEX Hit Rate) is tight and stable:
+52.48%-53.21% across all 498 launches — but this is a *unit-wide* metric (L1TEX is the same physical unit serving
+both global-memory caching and shared-memory accesses on real GPUs), so it isn't directly comparable to this
+simulator's `TEXTURE_ACC_R`-only L1 stat (§23.30's 0%) without conflating in the highly-reused shared-memory
+traffic — not pursued further, flagged so it isn't mistaken for a contradiction later.
+
+**Our simulator's aggregate L2 hit rate** (full-chip, summed across `GLOBAL_ACC_W` + `TEXTURE_ACC_R` +
+`CONST_ACC_R`, the apples-to-apples equivalent of ncu's unit-wide `lts__t_sector_hit_rate.pct`):
+`(380,928 + 929,400 + 512) / (507,904 + 1,169,859 + 528)` = **78.1%**.
+
+**Verdict: strong match.** 78.1% lands almost exactly on real hardware's *dominant mode* (~79-82%, where most of
+the 498 launches sit) and well inside the real range. Can't confirm an *exact* single-launch match (no way to
+tell which of the 498 differently-shaped real calls corresponds to our one captured trace), so this is a strong
+directional/order-of-magnitude validation of the L2-normal cache model's reuse behavior for this kernel, not a
+verified one-to-one number match — but it's a real, independent confirmation of §23.30's finding that cross-CTA
+L2 reuse is substantial and is being captured correctly, not missed.
+
+### 23.32 Roofline: k3's arithmetic intensity sits just above the ridge point, yet hits neither ceiling — latency-bound, not throughput-bound
+
+Built from numbers already measured this session, not new profiling. H100 SXM5 peak specs confirmed via NVIDIA's
+own datasheet (web search, to avoid repeating §23.29's mistake of asserting an unverified hardware claim):
+**1,979 TOPS dense INT8** (3,958 with 2:4 sparsity), **3,350 GB/s HBM3**.
+
+**Work done (same for sim and real — identical instruction stream):**
+- §23.28's single-subcore (2-warp) commit-trace capture measured **3,840 dynamic `IMMA.16832.S8.S8` instances** →
+  1,920/warp → ×8 warps/CTA (12.48% sim occupancy × 64 max warps/SM = 8 active warps = exactly 1 CTA's worth;
+  matches real hardware's `Achieved Occupancy` = 12.49% median almost exactly, §23.31's CSV) → 15,360 IMMA/CTA ×
+  132 CTAs (grid=132=#SMs, uniform tile work, no remainder tiles) = **2,027,520 dynamic IMMA instructions, full
+  kernel**.
+- `IMMA.16832` = PTX `mma.m16n8k32` INT8 → ops/instr = 2×16×8×32 = **8,192** (NVIDIA's own TOPS convention) →
+  **16.61 GOp total work**.
+
+**Time and bandwidth:**
+- Real: 166,246 cycles @ 1.62 GHz = **102.62 μs** (independently reproduces the documented 102,621 ns real
+  target — confirms 1.62 GHz, not the baseline config's 1.83 GHz, is the right clock for this comparison).
+  `Memory Throughput` (ncu, §23.31's CSV, 498 launches, median) = 243.5 GB/s → bytes moved = 243.5 GB/s ×
+  102.62 μs ≈ **25.0 MB**.
+- Sim (current best, §23.25): 208,119 cycles @ 1.62 GHz = **128.47 μs**. `DRAM_BW_total` = 314.25 GB/s → bytes
+  moved ≈ **40.4 MB** (sim moves more bytes in less cycle-time than real, consistent with its higher overall
+  miss/traffic findings elsewhere in this doc).
+
+| | Real H100 | Our sim |
+|---|---|---|
+| Achieved TOPS | 16.61e9/102.62µs = **161.9 TOPS** | 16.61e9/128.47µs = **129.3 TOPS** |
+| % of peak (1979 TOPS) | **8.2%** | **6.5%** |
+| Achieved BW | 243.5 GB/s | 314.25 GB/s |
+| % of peak (3350 GB/s) | **7.3%** | **9.4%** |
+| Arithmetic intensity | 16.61e9/25.0e6 B ≈ **665 ops/byte** | (same work, different byte count — order-of-magnitude similar) |
+| Ridge point (AI\* = 1979e12/3350e9) | **591 ops/byte** (HW-fixed, same for both) | |
+
+**Finding**: k3's AI (~665 ops/byte) sits just *above* the ridge point (591) — by naive roofline that nominally
+places it on the compute-bound side. But real hardware achieves only 8.2% of peak compute *and* only 7.3% of peak
+bandwidth simultaneously — nowhere near either ceiling. That is the signature of a kernel sitting deep inside the
+roof, not pinned to either edge: **latency/occupancy-bound, not throughput-bound by compute or memory**. Consistent
+with everything else found this session/prior sessions: 12.5% occupancy (real and sim agree almost exactly),
+dependency-chain/scoreboard stalls dominating real hardware's own per-warp stall breakdown (item 11: `wait`+
+`long_scoreboard` = 31.3%, `math_pipe_throttle` only 5.07%), and every pure-capacity/bandwidth lever tested this
+session (MSHR width, write-queue width §item 10, L1D/L2 cache-model normalization) failing to move the cycle gap,
+while issue/dependency-latency-shaped levers (early-forward bypass, §23.25) did. Roofline analysis by itself does
+not explain k3's sim-vs-real gap — the gap is a scheduling/latency story, not a peak-resource story.
+
+**Caveats**: IMMA dynamic count is extrapolated from one captured subcore/CTA to the full 132-CTA chip (reasonable
+given uniform grid/tile shape, not independently re-measured per-CTA). Real bytes-moved figure derives from
+`Memory Throughput` × the *documented* real duration (102,621 ns), not a duration column in the same CSV (this
+profiling pass collected occupancy/hit-rate/throughput metrics, not `gpu__time_duration.sum`).
+
+### 23.33 General method: estimating peak FLOPS/TOPS and peak bandwidth analytically (no profiling needed)
+
+Recorded for reuse on future chips/configs without re-running anything — both peaks are pure algebra from
+published or back-solved hardware constants; the two come from independent parts of the chip and need different
+inputs.
+
+**Compute peak:**
+
+```
+Peak_ops/s = num_SMs × MMA_ops_retired_per_SM_per_cycle × clock_Hz
+```
+
+where `MMA_ops_retired_per_SM_per_cycle = (ops per MMA instruction) × (MMA instructions/cycle/SM)`, and
+`ops per MMA instr = 2×M×N×K` for whatever shape the instruction encodes (e.g. `IMMA.16832` = PTX
+`mma.m16n8k32` → 2×16×8×32 = **8,192 ops/instr** — NVIDIA's own TOPS-counting convention, mul+add as one pair).
+
+The one factor not derivable from instruction encoding + SM count alone is the **throughput rate** (MMAs/cycle/SM
+the tensor cores can actually retire) — a microarchitectural fact. Get it either from a vendor whitepaper, or by
+**back-solving from one published peak number**: `1979 TOPS / (132 SMs × 1.83 GHz) = 8192.0 ops/cycle/SM` for
+H100 — exactly one 8,192-op IMMA per SM per cycle, clean enough to not be a coincidence. This also explains why
+`SM90_H100`'s config uses a 1.83 GHz core clock: almost certainly chosen so the math reproduces NVIDIA's published
+spec exactly. Once this per-SM-per-cycle constant is known for a chip, it can be reused to estimate peak for other
+MMA shapes/precisions on that same chip with zero additional profiling.
+
+**Bandwidth peak — different inputs, SM/core count is irrelevant:**
+
+```
+Peak_BW(bytes/s) = (bus_width_bits / 8) × pin_transfer_rate_Hz
+```
+
+H100 SXM5: 5 active HBM3 stacks × 1024-bit/stack = 5,120-bit bus (confirmed via web search). Back-solving from the
+published 3,350 GB/s: `3350e9 × 8 / 5120 ≈ 5.23 Gb/s/pin` (HBM3 is rated up to 6.4 Gb/s/pin, so H100 runs it
+binned down to land on exactly 3.35 TB/s). Needs memory-subsystem facts (stack count, per-stack bus width, pin
+rate) — IMMA shape and SM count don't enter this formula at all.
+
+**Why this matters for roofline**: compute peak scales with SM/tensor-core count and clock; bandwidth peak scales
+with HBM stack count and pin rate — independent budgets set independently by the chip designers. Both peaks (and
+therefore the ridge point `AI* = peak_ops/peak_bytes`, §23.32's 591 ops/byte) are obtainable with **zero
+profiling**. What math alone cannot tell you is whether a *specific kernel* actually reaches either ceiling — that
+remains an occupancy/scheduling/latency question requiring real measurement, which is exactly why k3 needed
+profiling to reveal it sits at ~8% of *both* peaks despite an arithmetic intensity that nominally classifies it as
+compute-bound (§23.32).
+
+Sources: [NVIDIA H100 Datasheet](https://www.megware.com/fileadmin/user_upload/LandingPage%20NVIDIA/nvidia-h100-datasheet.pdf),
+[NVIDIA Hopper Architecture In-Depth](https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/),
+[TechPowerUp H100 SXM5 80GB Specs](https://www.techpowerup.com/gpu-specs/h100-sxm5-80-gb.c3900).
+
+### 23.23 Output-write epilogue: real L1D reservation contention, but a small (~1.24%) tail cost
+
+User noticed varying `GLOBAL_ACC_W` durations (234-422 cyc) in `[mem_request_trace]` output and asked whether
+writes reserve a resource and whether the variance is contention. Measured directly (`k3_all_debug.log`, isolated
+best config):
+
+- All 2,048 `GLOBAL_ACC_W` writes have `dram=0` — every one resolves inside L2, none ever reach DRAM (output tile
+  small enough that writes write-allocate into L2 without evicting to DRAM within the kernel's lifetime).
+- `avg dur = 288.6 cyc` (min 234, max 422) — real variance, not noise: confirmed by
+  `Total_core_cache_stats_breakdown[GLOBAL_ACC_W][RESERVATION_FAIL] = 6345` against only 2,048 successful writes —
+  each write averages ~3 failed reservation attempts (an MSHR/pending-request-table slot at the L1D/core level)
+  before succeeding, because all 8 warps hit their write-out epilogue in a tight simultaneous burst at kernel end.
+- **Tail-cost measurement**: first write `send=182,094`, last write `resp=184,381`, kernel ends at
+  `gpu_tot_sim_cycle=184,384` (only 3 cycles of slack after the last write resolves) — the write-out epilogue is
+  the literal last thing in the kernel, with nothing else to overlap/hide it. Tail span
+  `184,384 − 182,094 = 2,290 cycles` = **~1.24% of total kernel time**.
+
+**Verdict**: real, measurable contention (confirmed via reservation-fail counts), and it does measurably extend
+the kernel's tail — but at ~1.24% it's smaller than the barrier-stall cost (§23.5, 4.86%) and far below
+`SP_OP/scoreboard` (§23.19, 44% of stall events) — a small, real, now-quantified contributor, not a lever worth
+chasing on its own.
+
+### 23.15 Code changes this session, updated (uncommitted — see `git status`)
+
+| File | Change |
+|------|--------|
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/shader.h` | `issue_wait_trace_debug` member |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/gpu-sim.cc` | `-issue_wait_trace_debug` CLI registration |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/subcore.cc` | `[issue_wait_trace]` live per-cycle print (issued and stalled branches), with RAW/WAR collision-register lookup on scoreboard stalls |
+| `gpu-simulator/gpgpu-sim/src/gpgpu-sim/remodeling/sm.cc` | Commit-progress heartbeat now always-on (not gated by `-subcore_issue_debug`), interval 1,000→10,000 |
+
+---
+
+*Last updated: 2026-06-20 — added §23.14/23.15: found that 33.2% of all kernel stall events are pure WAR
+(anti-dependency) scoreboard hazards; `-scoreboard_war_mode disabled` gives a real, validated −3.21%
+(isolated)/−2.93% (full-chip) cycle reduction, narrowing the gap to real H100 from +30.2% to +26.35% — the first
+genuinely positive lever found this investigation. Not yet persisted to config or correctness-checked.*
 
 *Last updated: 2026-06-20 (Cursor) — added §22: L2-normal isolated experiment (−12.1% vs sectored 218,024→191,627
 cyc), `gpu-cache.cc` fill-path fix for L2-N + sectored-upstream mismatch, combined sync/mem trace analysis

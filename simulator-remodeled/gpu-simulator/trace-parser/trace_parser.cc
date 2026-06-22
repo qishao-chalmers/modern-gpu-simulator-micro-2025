@@ -347,14 +347,17 @@ std::vector<trace_command> trace_parser::parse_commandlist_file() {
         is_pushed = true;
       } else if(command.command_string.substr(0, 6) == "kernel") {
         command.m_type = command_type::kernel_launch;
-        if(kernel_id >= m_kernel_id_filter_start && kernel_id <= m_kernel_id_filter_end) {
+        //if(kernel_id >= m_kernel_id_filter_start && kernel_id <= m_kernel_id_filter_end) {
           is_pushed = true;
-        }
+        //}
         kernel_id++;
       }
       if(is_pushed) {
         command.command_string += ",deviceid-" + std::to_string(gpu_device_id) + ",streamid-" + std::to_string(stream.id());
         commandlist.push_back(command);
+        // print the command pushed to the commandlist and also kernel_id
+        std::cout << "command pushed to the commandlist: " << command.command_string <<
+        " kernel_id: " << kernel_id << std::endl;
       }
     }
   }
@@ -382,7 +385,13 @@ kernel_trace_t *trace_parser::parse_kernel_info(
   int gpuDeviceID = -1;
   parseKernelAndStreamID(kerneltraces_filepath, kernelid, streamid, gpuDeviceID);
   const dynamic_trace::gpu_device &gpu_dev = (*dyn_trace.mutable_gpu_device())[0];
-  const dynamic_trace::kernel &ker = gpu_dev.streams().at(streamid).kernels(kernelid-1);
+  const dynamic_trace::cuda_stream &stream = gpu_dev.streams().at(streamid);
+  // kernels() is locally indexed from 0, but its first entry's global id() is 1 for a
+  // complete trace and >1 for a trace generated with DYNAMIC_KERNEL_LIMIT_START (e.g. the
+  // decode retrace, where kernels() starts at global id 2363). Derive the offset from the
+  // trace itself rather than from a CLI filter flag, so the same code path is correct for
+  // both a complete trace and a kernel-id-windowed one.
+  const dynamic_trace::kernel &ker = stream.kernels(kernelid - stream.kernels(0).id());
 
   std::cout << "Processing kernel " << kerneltraces_filepath << std::endl;
   
@@ -455,7 +464,10 @@ void trace_parser::get_next_threadblock_traces(
   }
   input.close();
   unsigned int size_traced_instructions_num_used_vector = gpu == nullptr ? 32 : 1;
-  std::cout << "thread block = " << tb_cur.block_id().x() << "," << tb_cur.block_id().y() << "," << tb_cur.block_id().z() << std::endl;
+  //std::cout << "thread block = " <<
+  // tb_cur.block_id().x() << "," <<
+  // tb_cur.block_id().y() << "," <<
+  // tb_cur.block_id().z() << std::endl;
   for(auto warp : tb_cur.warps()) {
     previous_traced_pc = 0;
     inst_count = 0;

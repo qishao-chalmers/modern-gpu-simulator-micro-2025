@@ -840,6 +840,30 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &is_subcore_round_robin_issue_scheduler,
                          "If enabled, subcore issue priority rotates every cycle (round-robin) instead of sticking to the warp that last issued (greedy-then-highest-id baseline) (default = disabled)",
                          "0");
+  // Qi: decouple the FETCH priority pointer from the issue priority pointer.
+  // Baseline behavior re-syncs m_greedy_pointer_fetch to m_greedy_pointer_issue
+  // every cycle (Subcore::cycle()), so whichever warp is currently winning
+  // issue arbitration also always wins fetch arbitration -- a warp that keeps
+  // issuing can starve its subcore-mate's fetch indefinitely (notes
+  // Sec.23.2 addendum). When enabled, fetch instead round-robins its own
+  // pointer independently after every fetch attempt, while issue keeps its
+  // own (possibly still greedy) policy untouched.
+  option_parser_register(opp, "-is_subcore_fetch_round_robin_independent", OPT_BOOL,
+                         &is_subcore_fetch_round_robin_independent,
+                         "If enabled, the fetch-arbitration priority pointer round-robins on its own "
+                         "instead of being re-synced to the issue priority pointer every cycle "
+                         "(default = disabled)",
+                         "0");
+  // Qi: greedy-then-random tie-break. Keeps the "stick to whoever issued
+  // last, as long as it stays ready" greedy behavior, but when the greedy
+  // warp isn't ready and there's a tie among the rest, break it randomly
+  // instead of always favoring the highest dynamic_warp_id. Targets the
+  // deterministic fetch/issue-priority seed bias (finilized_warps_assignation)
+  // without removing the flexibility that round-robin sacrifices.
+  option_parser_register(opp, "-is_subcore_random_tiebreak_issue_scheduler", OPT_BOOL,
+                         &is_subcore_random_tiebreak_issue_scheduler,
+                         "If enabled, subcore issue priority tie-break (among non-greedy warps) is random instead of highest-dynamic-warp-id (default = disabled)",
+                         "0");
   option_parser_register(opp, "-is_scoreboard_release_at_ex", OPT_BOOL,
                          &is_scoreboard_release_at_ex,
                          "If enabled, release scoreboard destination registers when an instruction "
@@ -1012,6 +1036,40 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "When >0, override IMMA dependent latency after formula (H100 ubench ~24 cyc). "
                          "0=use formula (default=0)",
                          "0");
+  option_parser_register(opp, "-is_register_bypass_forwarding_enabled", OPT_BOOL,
+                         &is_register_bypass_forwarding_enabled,
+                         "Qi: model a limited register bypass/forwarding network -- a RAW-dependent "
+                         "consumer can read a producer's result before it's fully written back to the RF, "
+                         "within -register_bypass_window_cycles and bounded by "
+                         "-register_bypass_ports_per_subcore bypass ports per subcore per cycle. WAW "
+                         "hazards are never bypass-eligible. (default=0/off)",
+                         "0");
+  option_parser_register(opp, "-register_bypass_window_cycles", OPT_INT32,
+                         &register_bypass_window_cycles,
+                         "Qi: how many cycles after a producer leaves EX its result stays forwardable "
+                         "via the bypass network (default=2)",
+                         "2");
+  option_parser_register(opp, "-register_bypass_ports_per_subcore", OPT_INT32,
+                         &register_bypass_ports_per_subcore,
+                         "Qi: max number of distinct registers the bypass network can forward per "
+                         "subcore per cycle (default=1)",
+                         "1");
+  option_parser_register(opp, "-register_early_forward_sp_op_enabled", OPT_BOOL,
+                         &is_register_early_forward_sp_op_enabled,
+                         "Qi: for SP_OP (FP32 ADD/MUL/MAD) instructions only, mark the bypass-forward "
+                         "entry at dispatch (issue into the FU) instead of at EX-finish, available after "
+                         "only -register_early_forward_delay_cycles instead of the full EX latency. "
+                         "Models early ALU-output forwarding -- real H100 SASS shows this dequant-"
+                         "accumulate chain sustains ~1.2-cycle effective dependent latency, far below "
+                         "this model's 4-cycle EX latency (see notes/prefill-k3-real-hw-correlation.md "
+                         "Sec.23.22/23.24). Requires -is_register_bypass_forwarding_enabled. "
+                         "(default=0/off)",
+                         "0");
+  option_parser_register(opp, "-register_early_forward_delay_cycles", OPT_INT32,
+                         &register_early_forward_delay_cycles,
+                         "Qi: cycles after dispatch before an early-forwarded SP_OP result becomes "
+                         "available to consumers (default=1)",
+                         "1");
   option_parser_register(opp, "-branch_latency", OPT_INT32,
                          &branch_latency, "Latency of the branch instructions."
                          "Configure to any positive number (default=1)",
@@ -1373,6 +1431,16 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                           &subcore_issue_debug_stop_gpu_cycle,
                           "Stop simulation after this gpu_sim cycle and print stall "
                           "summary (0=disabled; use with k3-only filter)",
+                          "0");
+  // Qi: live per-cycle issue-wait trace -- for every warp on SM0 (all subcores), every
+  // cycle its instruction is at the head of the IBuffer, print whether it issued and,
+  // if not, exactly what it's waiting for (scoreboard collision register, barrier kind,
+  // fu_busy, result_queue, etc). Independent of -subcore_issue_debug's aggregate stats.
+  option_parser_register(opp, "-issue_wait_trace_debug", OPT_BOOL,
+                          &issue_wait_trace_debug,
+                          "If enabled, print [issue_wait_trace] every cycle for every warp "
+                          "on SM0: issued or not, and the specific reason/collision register "
+                          "if not (default=0)",
                           "0");
   // Qi: isolation experiment -- skip binding/issuing CTAs to every SM except this one
   extern int g_debug_isolate_sm_id;

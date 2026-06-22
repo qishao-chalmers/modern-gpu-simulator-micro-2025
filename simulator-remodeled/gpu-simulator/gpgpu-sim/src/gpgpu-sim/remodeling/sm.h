@@ -160,6 +160,8 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void instruction_retirement(warp_inst_t *instruction);
   void release_scoreboard_registers(warp_inst_t *instruction);
   void maybe_release_scoreboard_at_ex(warp_inst_t *instruction);
+  void maybe_record_register_bypass(warp_inst_t *instruction);
+  void maybe_record_register_bypass_early(warp_inst_t *instruction, operation_pipeline_t op_pipe);
   void issue_warp(register_set_uniptr &warp, warp_inst_t *pI,
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned subcore_id, bool use_traditional_scoreboarding);
