@@ -106,6 +106,9 @@ class gpgpu_sim_wrapper {};
 
 #include <stdio.h>
 #include <string.h>
+#include <cctype>
+#include <cxxabi.h>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -1070,6 +1073,30 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "Qi: cycles after dispatch before an early-forwarded SP_OP result becomes "
                          "available to consumers (default=1)",
                          "1");
+  option_parser_register(opp, "-is_quantized_weight_dram_compression_enabled", OPT_BOOL,
+                         &is_quantized_weight_dram_compression_enabled,
+                         "Qi: research experiment -- model quantized-weight DRAM "
+                         "compression for GEMV/GEMM weight reads. For a read landing in a "
+                         "configured weight-matrix address region (see "
+                         "-quantized_weight_region_file), shrink the DRAM-side request size "
+                         "to -quantized_weight_compression_bits/8 of the original for the "
+                         "data-transfer timing model only (dram_t::push/cycle); the response "
+                         "size is restored before it leaves DRAM, so icnt/L2/L1 and "
+                         "functional correctness are unaffected. (default=0/off)",
+                         "0");
+  option_parser_register(opp, "-quantized_weight_compression_bits", OPT_INT32,
+                         &quantized_weight_compression_bits,
+                         "Qi: compressed weight bit-width, numerator over an 8-bit baseline "
+                         "(e.g. 2 or 3 for 2-bit/3-bit quantization). Only used when "
+                         "-is_quantized_weight_dram_compression_enabled is set. (default=8)",
+                         "8");
+  option_parser_register(opp, "-quantized_weight_region_file", OPT_CSTR,
+                         &quantized_weight_region_file,
+                         "Qi: path to the JSON file produced by "
+                         "log/tmp_log/detect_weight_regions.py, mapping kernel_id -> "
+                         "{base,size} weight-matrix address region. Loaded once at init when "
+                         "-is_quantized_weight_dram_compression_enabled is set.",
+                         "");
   option_parser_register(opp, "-branch_latency", OPT_INT32,
                          &branch_latency, "Latency of the branch instructions."
                          "Configure to any positive number (default=1)",
@@ -1450,6 +1477,14 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                           "(isolates the kernel to one SM, zero inter-SM contention). "
                           "-1 = disabled (default)",
                           "-1");
+  // Qi: one-off debug trace for verifying IPOLY's real post-hash channel
+  // spread (addrdec.cc, IPOLY case) for the non-power-of-2 n_mem case.
+  extern int g_debug_addrdec_trace;
+  option_parser_register(opp, "-debug_addrdec_trace", OPT_BOOL,
+                          &g_debug_addrdec_trace,
+                          "If true, print [addrdec_trace] for every IPOLY-indexed "
+                          "address decode (default=0)",
+                          "0");
   // Qi: per-stage mem_fetch latency mean/variance, split by request PC vs a target PC range
   option_parser_register(opp, "-mem_fetch_stage_latency_debug", OPT_BOOL,
                           &g_mem_fetch_stage_latency_debug,
@@ -1922,6 +1957,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   m_functional_sim_kernel = NULL;
 
   create_gpu_per_sm_stats();
+
+  if (m_shader_config->is_quantized_weight_dram_compression_enabled) {
+    load_quantized_weight_regions(m_shader_config->quantized_weight_region_file);
+  }
 }
 
 gpgpu_sim::~gpgpu_sim() {
@@ -1944,6 +1983,72 @@ gpgpu_sim::~gpgpu_sim() {
   shader_CTA_count_destroy();
   time_vector_destroy();
   ptx_file_line_stats_destroy_exposed_latency_tracker();
+}
+
+// Qi: quantized-weight DRAM compression (research experiment) -- region-file loader.
+// The file is produced by log/tmp_log/detect_weight_regions.py and is a small, flat
+// JSON object we generate ourselves: {"<kernel_id>": {"kernel_id":N,"base":N,"size":N,
+// ...}, ...}. Rather than pull a JSON library into the gpgpu-sim Makefile build (it's
+// kept dependency-free), we scan for the three integer fields we need directly.
+static bool gpu_sim_extract_uint64_after(const std::string &text, size_t from,
+                                         const char *key, unsigned long long &out) {
+  std::string needle = std::string("\"") + key + "\":";
+  size_t pos = text.find(needle, from);
+  if (pos == std::string::npos) return false;
+  pos += needle.size();
+  while (pos < text.size() && std::isspace((unsigned char)text[pos])) pos++;
+  size_t start = pos;
+  while (pos < text.size() && std::isdigit((unsigned char)text[pos])) pos++;
+  if (pos == start) return false;
+  out = std::stoull(text.substr(start, pos - start));
+  return true;
+}
+
+void gpgpu_sim::load_quantized_weight_regions(const char *path) {
+  if (path == NULL || path[0] == '\0') {
+    fprintf(stderr,
+            "[quantized_weight] WARNING: compression enabled but "
+            "-quantized_weight_region_file is empty; no regions loaded.\n");
+    return;
+  }
+  std::ifstream f(path);
+  if (!f.is_open()) {
+    fprintf(stderr, "[quantized_weight] WARNING: could not open region file %s\n", path);
+    return;
+  }
+  std::stringstream ss;
+  ss << f.rdbuf();
+  std::string content = ss.str();
+
+  unsigned int loaded = 0;
+  size_t pos = 0;
+  while (true) {
+    size_t kpos = content.find("\"kernel_id\":", pos);
+    if (kpos == std::string::npos) break;
+    size_t next_kpos = content.find("\"kernel_id\":", kpos + 1);
+    size_t scan_end = (next_kpos == std::string::npos) ? content.size() : next_kpos;
+    std::string obj = content.substr(kpos, scan_end - kpos);
+    unsigned long long kernel_id = 0, base = 0, size = 0;
+    if (gpu_sim_extract_uint64_after(obj, 0, "kernel_id", kernel_id) &&
+        gpu_sim_extract_uint64_after(obj, 0, "base", base) &&
+        gpu_sim_extract_uint64_after(obj, 0, "size", size)) {
+      m_quantized_weight_regions[(unsigned int)kernel_id] = std::make_pair(base, size);
+      loaded++;
+    }
+    pos = scan_end;
+  }
+  fprintf(stdout, "[quantized_weight] loaded %u weight region(s) from %s\n", loaded, path);
+}
+
+bool gpgpu_sim::get_quantized_weight_region(unsigned int kernel_id,
+                                            unsigned long long &base,
+                                            unsigned long long &size) const {
+  std::unordered_map<unsigned int, std::pair<unsigned long long, unsigned long long>>::const_iterator it =
+      m_quantized_weight_regions.find(kernel_id);
+  if (it == m_quantized_weight_regions.end()) return false;
+  base = it->second.first;
+  size = it->second.second;
+  return true;
 }
 
 void gpgpu_sim::create_gpu_per_sm_stats() {
@@ -2319,6 +2424,47 @@ std::string gpgpu_sim::executed_kernel_info_string() {
   return statout.str();
 }
 
+// Qi: human-readable kernel name for the gpu_sim_cycle/gpu_tot_sim_cycle status lines --
+// executed_kernel_name() returns the raw (Itanium-mangled) C++ symbol, e.g.
+// "_Z13mul_mat_vec_qIL9ggml_type8E...", which is unreadable at a glance. Demangle each
+// space-separated name (there can be more than one with concurrent kernels) via the same
+// libstdc++/libc++ demangler `c++filt` uses, falling back to the original token if it
+// isn't a mangled name (or demangling fails) so the printf never loses information.
+static std::string demangle_kernel_names(const std::string &mangled_names) {
+  std::istringstream iss(mangled_names);
+  std::ostringstream oss;
+  std::string token;
+  bool first = true;
+  while (iss >> token) {
+    if (!first) oss << " ";
+    first = false;
+    int status = 0;
+    char *demangled = abi::__cxa_demangle(token.c_str(), NULL, NULL, &status);
+    if (status != 0 || !demangled) {
+      // Traces from this tracer append a literal "___<digits>" disambiguation suffix
+      // (exactly 3 underscores, e.g. "___0") straight onto the mangled symbol with no
+      // valid mangling of its own, which makes the demangler reject the whole string.
+      // Strip just those 3 underscores plus the digits (not any further underscores --
+      // those can be legitimate trailing characters of the real mangled name, e.g. the
+      // "S3_" substitution back-reference token) and retry once.
+      size_t end = token.size();
+      while (end > 0 && isdigit((unsigned char)token[end - 1])) end--;
+      if (end >= 3 && end < token.size() && token[end - 1] == '_' &&
+          token[end - 2] == '_' && token[end - 3] == '_') {
+        std::string trimmed = token.substr(0, end - 3);
+        demangled = abi::__cxa_demangle(trimmed.c_str(), NULL, NULL, &status);
+      }
+    }
+    if (status == 0 && demangled) {
+      oss << demangled;
+      free(demangled);
+    } else {
+      oss << token;
+    }
+  }
+  return oss.str();
+}
+
 std::string gpgpu_sim::executed_kernel_name() {
   std::stringstream statout;  
   if( m_executed_kernel_names.size() == 1)
@@ -2435,10 +2581,15 @@ void gpgpu_sim::gpu_print_stat() {
   
   fprintf(statfout, "%s", kernel_info_str.c_str());
 
-  printf("gpu_sim_cycle = %lld\n", gpu_sim_cycle);
+  printf("gpu_sim_cycle = %lld  gpu_sim_time_us = %.4f  kernel = %s\n",
+         gpu_sim_cycle, gpu_sim_cycle * m_config.core_period * 1e6,
+         demangle_kernel_names(executed_kernel_name()).c_str());
   m_gpu_per_sm_stats.m_stats_map["gpu_sim_insn"]->print(statfout);
   printf("gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
-  printf("gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
+  printf("gpu_tot_sim_cycle = %lld  gpu_tot_sim_time_us = %.4f  kernel = %s\n",
+         gpu_tot_sim_cycle + gpu_sim_cycle,
+         (gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period * 1e6,
+         demangle_kernel_names(executed_kernel_name()).c_str());
   printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
   printf("gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /
                                        (gpu_tot_sim_cycle + gpu_sim_cycle));
@@ -3316,7 +3467,7 @@ void gpgpu_sim::cycle() {
           // printf("Flushed L2 caches...\n");
           if (m_memory_config->m_L2_config.get_num_lines()) {
             int dlc = 0;
-            for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+            for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
               // dlc = m_memory_sub_partition[i]->flushL2();
               dlc = m_memory_sub_partition[i]->invalidateL2();
               assert(dlc == 0);  // TODO: need to model actual writes to DRAM here

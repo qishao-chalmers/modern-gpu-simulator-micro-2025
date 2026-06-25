@@ -79,6 +79,12 @@ public:
 
     unsigned int get_unique_function_id(std::string kernel_name);
 
+    // Trace-id-windowed retraces (e.g. DYNAMIC_KERNEL_LIMIT_START) can assign function_unique_id
+    // values in the dynamic trace that don't match this static catalog's numbering for the same
+    // kernel. Returns candidate_id unchanged when it already resolves (the common case); otherwise
+    // falls back to a name-based lookup, which is always consistent regardless of id-space drift.
+    unsigned int resolve_unique_function_id(unsigned int candidate_id, std::string kernel_name);
+
     search_func_addr_result search_function_addr(uint64_t func_addr);
 
     void set_benchmark_name(std::string benchmark_name);

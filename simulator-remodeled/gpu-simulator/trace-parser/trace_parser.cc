@@ -266,7 +266,8 @@ bool inst_trace_t::parse_from_pb(dynamic_trace::instruction pb_inst,
                                      unsigned trace_version, gpgpu_sim *gpu, std::string kernel_name, traced_execution &static_trace_info) {
   m_pc = pb_inst.pc();
   mask = pb_inst.active_mask() & pb_inst.predicate_mask();
-  m_unique_function_id = pb_inst.function_unique_id();
+  m_unique_function_id = static_trace_info.resolve_unique_function_id(
+      pb_inst.function_unique_id(), kernel_name);
   unsigned int num_memrefs = pb_inst.addresses_size();
   std::bitset<WARP_SIZE> mask_bits(mask);
   opcode = static_trace_info.get_kernel_by_unique_function_id(m_unique_function_id).get_instruction(m_pc).get_op_code();
@@ -412,7 +413,8 @@ kernel_trace_t *trace_parser::parse_kernel_info(
   kernel_info->nvbit_verion = dyn_trace.nvbit_version();
   kernel_info->shmem_base_addr = ker.shared_memory_base_address();
   kernel_info->local_base_addr = ker.local_memory_base_address();
-  kernel_info->func_unique_id = ker.function_unique_id();
+  kernel_info->func_unique_id = enahnced_trace_info.resolve_unique_function_id(
+      ker.function_unique_id(), kernel_info->kernel_name);
   kernel_info->is_cap_from_binary = enahnced_trace_info.get_kernel_by_unique_function_id(kernel_info->func_unique_id).is_captured_from_binary();
   kernel_info->next_tb_to_parse_x = 0;
   kernel_info->next_tb_to_parse_y = 0;

@@ -33,6 +33,8 @@
 #include "gpu-sim.h"
 #include "hashing.h"
 
+int g_debug_addrdec_trace = 0;
+
 static long int powli(long int x, long int y);
 static unsigned int LOGB2_32(unsigned int v);
 static unsigned next_powerOf2(unsigned n);
@@ -144,15 +146,25 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
     case IPOLY: {
       // assert(!gap);
       unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
-      unsigned sub_partition = tlx->chip * m_n_sub_partition_in_channel +
+      unsigned pre_hash_subpart = tlx->chip * m_n_sub_partition_in_channel +
                                (tlx->bk & sub_partition_addr_mask);
-      sub_partition = ipoly_hash_function(
-          rest_of_addr_high_bits, sub_partition,
+      unsigned sub_partition = ipoly_hash_function(
+          rest_of_addr_high_bits, pre_hash_subpart,
           nextPowerOf2_m_n_channel * m_n_sub_partition_in_channel);
 
       if (gap)  // if it is not 2^n partitions, then take modular
         sub_partition =
             sub_partition % (m_n_channel * m_n_sub_partition_in_channel);
+
+      // Qi: one-off debug trace to verify IPOLY's real post-hash channel
+      // spread for the non-power-of-2 n_mem=80 case (see notes/).
+      extern int g_debug_addrdec_trace;
+      if (g_debug_addrdec_trace) {
+        printf("[addrdec_trace] addr=0x%llx higher_bits=0x%llx pre_hash_subpart=%u "
+               "post_hash_subpart=%u chip=%u\n",
+               (unsigned long long)addr, (unsigned long long)rest_of_addr_high_bits,
+               pre_hash_subpart, sub_partition, sub_partition / m_n_sub_partition_in_channel);
+      }
 
       tlx->chip = sub_partition / m_n_sub_partition_in_channel;
       tlx->sub_partition = sub_partition;

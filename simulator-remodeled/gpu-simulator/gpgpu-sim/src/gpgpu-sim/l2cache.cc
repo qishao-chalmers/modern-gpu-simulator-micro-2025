@@ -70,6 +70,13 @@ mem_fetch *partition_mf_allocator::alloc(
   mem_fetch *mf =
       new mem_fetch(access, NULL, wr ? WRITE_PACKET_SIZE : READ_PACKET_SIZE,
                     wid, sid, tpc, m_memory_config, cycle, original_mf);
+  // Qi: quantized-weight DRAM compression (research experiment) -- this is the actual
+  // sector-split allocator L2 uses (breakdown_request_to_sector_requests); these sector
+  // mem_fetches, not the original un-split one, are what travel to dram_t::push(), so
+  // inherit the trace kernel id from the parent request instead of losing it here.
+  if (original_mf) {
+    mf->set_kernel_id(original_mf->get_kernel_id());
+  }
   return mf;
 }
 memory_partition_unit::memory_partition_unit(unsigned partition_id,

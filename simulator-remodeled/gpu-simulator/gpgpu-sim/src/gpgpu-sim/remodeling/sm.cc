@@ -1087,7 +1087,8 @@ void SM::create_memory_interfaces() {
   } else {
     m_icnt = new shader_memory_interface(this, m_cluster);
   }
-  m_mem_fetch_allocator = std::make_shared<shader_core_mem_fetch_allocator>(m_sm_id, m_tpc_id, m_memory_config);
+  m_mem_fetch_allocator = std::make_shared<shader_core_mem_fetch_allocator>(
+      m_sm_id, m_tpc_id, m_memory_config, (core_t *)this);
 
   char name[STRSIZE];
   snprintf(name, STRSIZE, "L1I_%03d", m_sm_id);

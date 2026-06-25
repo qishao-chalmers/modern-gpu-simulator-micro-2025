@@ -71,6 +71,13 @@ unsigned int traced_execution::get_unique_function_id(std::string kernel_name) {
     return m_kernels[kernel_name]->get_unique_function_id();
 }
 
+unsigned int traced_execution::resolve_unique_function_id(unsigned int candidate_id, std::string kernel_name) {
+    if (has_kernel_with_unique_function_id(candidate_id)) {
+        return candidate_id;
+    }
+    return get_unique_function_id(kernel_name);
+}
+
 search_func_addr_result traced_execution::search_function_addr(uint64_t func_addr) {
     auto it_func = m_func_addr_to_unique_function_id.find(func_addr);
     if(it_func != m_func_addr_to_unique_function_id.end()) {

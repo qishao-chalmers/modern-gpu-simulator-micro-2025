@@ -108,6 +108,14 @@ class mem_fetch {
   void set_subcore(int subcore) { m_subcore = subcore; } // MOD. Added L0I
   unsigned get_data_size() const { return m_data_size; }
   void set_data_size(unsigned size) { m_data_size = size; }
+  // Quantized-weight DRAM compression (research experiment): when a read hits the
+  // configured weight region, dram_t::push() shrinks m_data_size to the compressed
+  // size for the DRAM-side timing model only, and stashes the real size here;
+  // dram_t::cycle() restores it once the (shrunk) transfer completes, before the
+  // response travels back up through icnt/L2/L1 -- those stay byte-size-unaware.
+  // 0 means "not compressed" (a real data size is never 0).
+  unsigned get_original_data_size() const { return m_original_data_size; }
+  void set_original_data_size(unsigned size) { m_original_data_size = size; }
   unsigned get_ctrl_size() const { return m_ctrl_size; }
   unsigned size() const { return m_data_size + m_ctrl_size; }
   bool is_write() { return m_access.is_write(); }
@@ -227,6 +235,7 @@ class mem_fetch {
   // request type, address, size, mask
   mem_access_t m_access;
   unsigned m_data_size;  // how much data is being written
+  unsigned m_original_data_size;  // backup of m_data_size while DRAM-compressed; 0 = not compressed
   unsigned
       m_ctrl_size;  // how big would all this meta data be in hardware (does not
                     // necessarily match actual size of mem_fetch)

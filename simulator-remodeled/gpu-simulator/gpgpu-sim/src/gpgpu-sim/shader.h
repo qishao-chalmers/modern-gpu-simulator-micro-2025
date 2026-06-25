@@ -2095,6 +2095,13 @@ class shader_core_config : public core_config {
   // full EX latency. See SM::maybe_record_register_bypass_early.
   bool is_register_early_forward_sp_op_enabled;
   int register_early_forward_delay_cycles;
+  // Qi: quantized-weight DRAM compression (research experiment) -- for reads landing in
+  // a configured weight-matrix address region, shrink the DRAM-side request size to
+  // (bits/8) of the original for the data-transfer timing model only, then restore it
+  // before the response leaves DRAM. See dram_t::push()/cycle(), mem_fetch::m_original_data_size.
+  bool is_quantized_weight_dram_compression_enabled;
+  int quantized_weight_compression_bits;  // numerator over a baseline of 8 (e.g. 2 or 3)
+  char *quantized_weight_region_file;  // path to detect_weight_regions.py's JSON output
   int branch_latency;
   int half_latency;
   int uniform_latency;
@@ -2991,11 +2998,17 @@ class shader_core_stats : public shader_core_stats_pod {
 class memory_config;
 class shader_core_mem_fetch_allocator : public mem_fetch_allocator {
  public:
+  // Qi: `core` is the owning core (shader_core_ctx in the classic pipeline, SM in the
+  // redesigned remodeling/ pipeline -- both derive from core_t), used only to look up
+  // the trace kernel id of whatever kernel is currently resident on it, for the
+  // quantized-weight DRAM compression experiment (see alloc() below).
   shader_core_mem_fetch_allocator(unsigned core_id, unsigned cluster_id,
-                                  const memory_config *config) {
+                                  const memory_config *config,
+                                  class core_t *core) {
     m_core_id = core_id;
     m_cluster_id = cluster_id;
     m_memory_config = config;
+    m_owning_core = core;
   }
   mem_fetch *alloc(new_addr_type addr, mem_access_type type, unsigned size,
                    bool wr, unsigned long long cycle) const;
@@ -3012,6 +3025,12 @@ class shader_core_mem_fetch_allocator : public mem_fetch_allocator {
         access, &inst_copy,
         access.is_write() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE,
         inst.warp_id(), m_core_id, m_cluster_id, m_memory_config, cycle);
+    // Qi: quantized-weight DRAM compression (research experiment) -- tag the request
+    // with the trace's global kernel id of whatever kernel is currently resident on
+    // this core, so dram_t::push() can look it up in the weight-region table.
+    if (m_owning_core && m_owning_core->get_kernel_info()) {
+      mf->set_kernel_id(m_owning_core->get_kernel_info()->get_trace_kernel_id());
+    }
     return mf;
   }
 
@@ -3019,6 +3038,7 @@ class shader_core_mem_fetch_allocator : public mem_fetch_allocator {
   unsigned m_core_id;
   unsigned m_cluster_id;
   const memory_config *m_memory_config;
+  class core_t *m_owning_core;
 };
 
 class shader_core_ctx : public core_t, public shader_core_ctx_wrapper {

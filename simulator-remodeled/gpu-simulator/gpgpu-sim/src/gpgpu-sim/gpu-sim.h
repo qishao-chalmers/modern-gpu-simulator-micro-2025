@@ -66,6 +66,8 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <unordered_map>
+#include <utility>
 #include "../abstract_hardware_model.h"
 #include "../option_parser.h"
 #include "../trace.h"
@@ -765,6 +767,12 @@ class gpgpu_sim : public gpgpu_t {
   void stop_all_running_kernels();
 
   void init();
+  // Quantized-weight DRAM compression (research experiment, see notes/): per-kernel
+  // weight-matrix address regions, detected offline by log/tmp_log/detect_weight_regions.py
+  // from the trace's own per-CTA addresses, loaded from -quantized_weight_region_file.
+  void load_quantized_weight_regions(const char *path);
+  bool get_quantized_weight_region(unsigned int kernel_id, unsigned long long &base,
+                                   unsigned long long &size) const;
   std::unique_ptr<grid_barrier_notify_info> register_grid_barrier_arrivement(mem_fetch *mf);
   void increase_num_threads_kernel(unsigned kernel_id, unsigned num_threads);
   void decrease_num_threads_kernel(unsigned kernel_id, unsigned num_threads);
@@ -864,6 +872,9 @@ class gpgpu_sim : public gpgpu_t {
 
 
  private:
+  // kernel_id -> (base_address, size_bytes) for quantized-weight DRAM compression
+  std::unordered_map<unsigned int, std::pair<unsigned long long, unsigned long long>>
+      m_quantized_weight_regions;
   void create_gpu_per_sm_stats();
   void gather_gpu_per_sm_stats();
   void reset_cycless_access_history();

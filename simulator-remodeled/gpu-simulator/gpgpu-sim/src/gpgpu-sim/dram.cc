@@ -268,6 +268,30 @@ void dram_t::push(class mem_fetch *data) {
   assert(id == data->get_tlx_addr()
                    .chip);  // Ensure request is in correct memory partition
 
+  // Qi: quantized-weight DRAM compression (research experiment). Reads that land in a
+  // configured weight-matrix address region get their DRAM-side request size shrunk to
+  // (bits/8) of the real size before the dram_req_t/timing model below ever sees it --
+  // dram_req_t::nbytes = mf->get_data_size() right after this, so shrinking here is
+  // equivalent to shrinking the transfer for the data-bus occupancy state machine in
+  // dram_t::cycle(). Restored in cycle() once the (shrunk) transfer completes, before the
+  // reply leaves DRAM -- icnt/L2/L1 and functional correctness never see the shrink.
+  const shader_core_config &qw_cfg = m_gpu->get_config().get_gpgpu_sim_config();
+  if (qw_cfg.is_quantized_weight_dram_compression_enabled && !data->get_is_write() &&
+      data->get_original_data_size() == 0) {
+    unsigned long long region_base = 0, region_size = 0;
+    if (m_gpu->get_quantized_weight_region(data->get_kernel_id(), region_base,
+                                           region_size) &&
+        data->get_addr() >= region_base &&
+        data->get_addr() < region_base + region_size) {
+      unsigned real_size = data->get_data_size();
+      unsigned compressed_size =
+          (real_size * (unsigned)qw_cfg.quantized_weight_compression_bits + 7) / 8;
+      if (compressed_size < 1) compressed_size = 1;
+      data->set_original_data_size(real_size);
+      data->set_data_size(compressed_size);
+    }
+  }
+
   dram_req_t *mrq =
       new dram_req_t(data, m_config->nbk, m_config->dram_bnk_indexing_policy,
                      m_memory_partition_unit->get_mgpu());
@@ -319,6 +343,13 @@ void dram_t::cycle() {
 
       if (cmd->dqbytes >= cmd->nbytes) {
         mem_fetch *data = cmd->data;
+        // Qi: quantized-weight DRAM compression -- restore the real data size before the
+        // reply travels back up through icnt/L2/L1, which are byte-size-unaware of the
+        // DRAM-side shrink. See dram_t::push() above.
+        if (data->get_original_data_size() != 0) {
+          data->set_data_size(data->get_original_data_size());
+          data->set_original_data_size(0);
+        }
         data->set_status(IN_PARTITION_MC_RETURNQ,
                          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
         if (data->get_access_type() != L1_WRBK_ACC &&

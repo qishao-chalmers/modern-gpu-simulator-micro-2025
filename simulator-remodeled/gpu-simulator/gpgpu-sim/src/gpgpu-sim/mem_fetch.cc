@@ -59,6 +59,7 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     assert(wid == m_inst.warp_id());
   }
   m_data_size = access.get_size();
+  m_original_data_size = 0;
   m_ctrl_size = ctrl_size;
   m_sid = sid;
   m_tpc = tpc;

@@ -114,6 +114,13 @@ mem_fetch *shader_core_mem_fetch_allocator::alloc(
   mem_fetch *mf = new mem_fetch(
       access, NULL, wr ? WRITE_PACKET_SIZE : READ_PACKET_SIZE, wid, m_core_id,
       m_cluster_id, m_memory_config, cycle, original_mf);
+  // Qi: quantized-weight DRAM compression (research experiment) -- this overload is
+  // the L2 sector-split path (breakdown_request_to_sector_requests); these sector
+  // mem_fetches, not the original un-split one, are what actually reach dram_t::push(),
+  // so inherit the trace kernel id from the parent request rather than re-deriving it.
+  if (original_mf) {
+    mf->set_kernel_id(original_mf->get_kernel_id());
+  }
   return mf;
 }
 /////////////////////////////////////////////////////////////////////////////
@@ -279,7 +286,8 @@ void shader_core_ctx::create_front_pipeline() {
     m_icnt = new shader_memory_interface(this, m_cluster);
   }
   m_mem_fetch_allocator =
-      new shader_core_mem_fetch_allocator(m_sid, m_tpc, m_memory_config);
+      new shader_core_mem_fetch_allocator(m_sid, m_tpc, m_memory_config,
+                                          (core_t *)this);
 
   // fetch
   m_last_warp_fetched = 0;

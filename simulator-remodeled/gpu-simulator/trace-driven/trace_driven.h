@@ -132,6 +132,10 @@ class trace_kernel_info_t : public kernel_info_t {
 
   kernel_trace_t *get_trace_info() { return m_kernel_trace_info; }
 
+  unsigned int get_trace_kernel_id() const override {
+    return m_kernel_trace_info->kernel_id;
+  }
+
   bool was_launched() { return m_was_launched; }
 
   void set_launched() { m_was_launched = true; }

@@ -309,6 +309,12 @@ class kernel_info_t {
            m_next_tid.x < m_block_dim.x;
   }
   unsigned get_uid() const { return m_uid; }
+  // Qi: quantized-weight DRAM compression (research experiment) needs the trace's own
+  // global kernel id (e.g. 2366), which differs from m_uid (a simulator-internal launch
+  // counter) under trace-id-windowed retraces. trace_kernel_info_t overrides this to
+  // return kernel_trace_t::kernel_id; the base default keeps non-trace-driven callers
+  // (functional-sim-only kernel_info_t instances) working unchanged.
+  virtual unsigned int get_trace_kernel_id() const { return m_uid; }
   std::string get_name() const { return name(); }
   std::string name() const;
 
