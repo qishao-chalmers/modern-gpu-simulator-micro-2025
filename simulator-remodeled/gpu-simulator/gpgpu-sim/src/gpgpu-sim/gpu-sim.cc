@@ -421,6 +421,9 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_perfect_mem", OPT_BOOL,
                          &gpgpu_perfect_mem,
                          "enable perfect memory mode (no cache miss)", "0");
+  option_parser_register(opp, "-gpgpu_const_cache_bypass_l2", OPT_BOOL,
+                         &gpgpu_const_cache_bypass_l2,
+                         "bypass L2 cache for constant-cache misses, route directly to DRAM", "0");
   option_parser_register(
       opp, "-n_regfile_gating_group", OPT_UINT32, &n_regfile_gating_group,
       "group of lanes that should be read/written together)", "4");
@@ -2749,8 +2752,23 @@ void gpgpu_sim::gpu_print_stat() {
       printf("L2_total_cache_reservation_fail_breakdown:\n");
       l2_stats.print_fail_stats(stdout, "L2_cache_stats_fail_breakdown");
       total_l2_css.print_port_stats(stdout, "L2_cache");
+      // Qi: per-kernel (non-cumulative) L2 delta -- see print_per_kernel_cache_delta's
+      // rationale in shader.cc; total_l2_css above is cumulative since simulation start.
+      {
+        struct cache_sub_stats l2_delta = total_l2_css - m_last_kernel_L2_css;
+        printf("L2_this_kernel_cache_accesses = %llu\n", l2_delta.accesses);
+        printf("L2_this_kernel_cache_misses = %llu\n", l2_delta.misses);
+        if (l2_delta.accesses > 0)
+          printf("L2_this_kernel_cache_miss_rate = %.4lf\n",
+                 (double)l2_delta.misses / (double)l2_delta.accesses);
+        printf("L2_this_kernel_cache_pending_hits = %llu\n", l2_delta.pending_hits);
+        printf("L2_this_kernel_cache_reservation_fails = %llu\n", l2_delta.res_fails);
+        m_last_kernel_L2_css = total_l2_css;
+      }
     }
   }
+
+  print_committed_inst_type_stats();
 
   if (m_config.gpgpu_cflog_interval != 0) {
     spill_log_to_file(stdout, 1, gpu_sim_cycle);
@@ -2788,6 +2806,37 @@ void gpgpu_sim::gpu_print_stat() {
 
   clear_executed_kernel_info();
   reset_gpu_per_sm_stats();
+}
+
+// Qi: cumulative + per-kernel committed-instruction count broken down by op_type
+// (uarch_op_t). Aggregates SM::m_committed_inst_type_count across all clusters/SMs;
+// the per-kernel figure is this cumulative total minus the snapshot taken at the
+// previous kernel boundary (same technique as print_per_kernel_cache_delta in shader.cc).
+void gpgpu_sim::print_committed_inst_type_stats() const {
+  std::map<int, unsigned long long> total_counts;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; ++i) {
+    std::map<int, unsigned long long> cluster_counts;
+    m_cluster[i]->get_committed_inst_type_counts(cluster_counts);
+    for (std::map<int, unsigned long long>::const_iterator it = cluster_counts.begin();
+         it != cluster_counts.end(); ++it) {
+      total_counts[it->first] += it->second;
+    }
+  }
+
+  printf("\n========= Committed instruction type stats =========\n");
+  for (std::map<int, unsigned long long>::const_iterator it = total_counts.begin();
+       it != total_counts.end(); ++it) {
+    op_type op = (op_type)it->first;
+    unsigned long long cumulative = it->second;
+    std::map<int, unsigned long long>::const_iterator prev_it =
+        m_last_kernel_committed_inst_type_count.find(it->first);
+    unsigned long long previous = (prev_it != m_last_kernel_committed_inst_type_count.end())
+                                      ? prev_it->second
+                                      : 0;
+    printf("committed_inst_type[%s] = %llu  this_kernel = %llu\n",
+           op_type_to_string(op), cumulative, cumulative - previous);
+  }
+  m_last_kernel_committed_inst_type_count = total_counts;
 }
 
 // performance counter that are not local to one shader
@@ -3249,25 +3298,37 @@ void gpgpu_sim::cycle() {
               (int)mf->get_sid() == g_mem_request_trace_sm_id) {
             unsigned long long send_t = mf->get_timestamp();
             unsigned long long resp_t = gpu_sim_cycle + gpu_tot_sim_cycle;
+            unsigned long long l2_arrival = mf->get_l2_arrival_cycle();
+            unsigned long long l2_rop_done = mf->get_l2_rop_done_cycle();
+            unsigned long long l2_access_done = mf->get_l2_access_done_cycle();
             if (mf->went_to_dram()) {
               printf(
                   "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
                   "send=%llu resp=%llu dur=%llu dram=1 dram_enter=%llu "
-                  "dram_exit=%llu dram_dur=%llu\n",
+                  "dram_exit=%llu dram_dur=%llu l2_arrival=%llu "
+                  "l2_rop_done=%llu l2_access_done=%llu icnt_out=%llu "
+                  "rop_wait=%llu l2_queue_access=%llu icnt_back=%llu\n",
                   mf->get_wid(), (unsigned long long)mf->get_pc(),
                   (unsigned long long)mf->get_addr(),
                   mem_access_type_str(mf->get_access_type()), send_t, resp_t,
                   resp_t - send_t, mf->get_dram_enter_cycle(),
                   mf->get_dram_exit_cycle(),
-                  mf->get_dram_exit_cycle() - mf->get_dram_enter_cycle());
+                  mf->get_dram_exit_cycle() - mf->get_dram_enter_cycle(),
+                  l2_arrival, l2_rop_done, l2_access_done,
+                  l2_arrival - send_t, l2_rop_done - l2_arrival,
+                  l2_access_done - l2_rop_done, resp_t - l2_access_done);
             } else {
               printf(
                   "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
-                  "send=%llu resp=%llu dur=%llu dram=0\n",
+                  "send=%llu resp=%llu dur=%llu dram=0 l2_arrival=%llu "
+                  "l2_rop_done=%llu l2_access_done=%llu icnt_out=%llu "
+                  "rop_wait=%llu l2_queue_access=%llu icnt_back=%llu\n",
                   mf->get_wid(), (unsigned long long)mf->get_pc(),
                   (unsigned long long)mf->get_addr(),
                   mem_access_type_str(mf->get_access_type()), send_t, resp_t,
-                  resp_t - send_t);
+                  resp_t - send_t, l2_arrival, l2_rop_done, l2_access_done,
+                  l2_arrival - send_t, l2_rop_done - l2_arrival,
+                  l2_access_done - l2_rop_done, resp_t - l2_access_done);
             }
           }
           ::icnt_push(m_shader_config->mem2device(i), mf->get_tpc(), mf,

@@ -1896,6 +1896,7 @@ class shader_core_config : public core_config {
   // data
   char *gpgpu_shader_core_pipeline_opt;
   bool gpgpu_perfect_mem;
+  bool gpgpu_const_cache_bypass_l2;  // Qi: bypass L2 for const-cache misses, send directly to DRAM
   bool gpgpu_clock_gated_reg_file;
   bool gpgpu_clock_gated_lanes;
   enum divergence_support_t model;
@@ -3140,6 +3141,13 @@ class shader_core_ctx : public core_t, public shader_core_ctx_wrapper {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+  // Qi: classic (non-remodeled) shader core doesn't track per-op_type committed-instruction
+  // counts -- this config family only uses the remodeled SM path (see remodeling/sm.h).
+  // Stubbed (empty) here purely to satisfy shader_core_ctx_wrapper's interface.
+  void get_committed_inst_type_counts(
+      std::map<int, unsigned long long> &counts) const {
+    counts.clear();
+  }
 
   void get_icnt_power_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
 
@@ -3675,6 +3683,8 @@ class simt_core_cluster {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+  void get_committed_inst_type_counts(
+      std::map<int, unsigned long long> &counts) const;
 
   void get_icnt_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
   float get_current_occupancy(unsigned long long &active,

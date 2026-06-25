@@ -300,6 +300,7 @@ class ldst_unit_sm : public functional_unit_shared_sm_part {
   l1_cache *m_L1D;         // data cache
 
   std::list<mem_fetch *> m_response_fifo;
+  std::list<mem_fetch *> m_const_cache_direct_dram_queue;  // Qi: for const-cache bypass-L2 path
   std::shared_ptr<Scoreboard> m_scoreboard;
   std::shared_ptr<Scoreboard_reads> m_scoreboard_reads; // MOD. Fix WAR at baseline.
   mem_fetch *m_next_global;
