@@ -275,6 +275,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const override;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const override;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const override;
+  void get_committed_inst_type_counts(
+      std::map<int, unsigned long long> &counts) const override {
+    counts = m_committed_inst_type_count;
+  }
 
   unsigned int inactive_lanes_accesses_sfu(unsigned active_count, double latency);
   unsigned int inactive_lanes_accesses_nonsfu(unsigned active_count,
@@ -344,6 +348,9 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned long long m_last_inst_gpu_sim_cycle;
   unsigned long long m_last_inst_gpu_tot_sim_cycle;
   unsigned long long m_committed_inst_count_progress;  // Qi: SM0-only commit-progress counter
+  // Qi: cumulative committed-instruction count per op_type (uarch_op_t), this SM only --
+  // aggregated across all SMs and snapshotted for per-kernel deltas in gpgpu_sim.
+  std::map<int, unsigned long long> m_committed_inst_type_count;
 
   const shader_core_config *m_config;
   const memory_config *m_memory_config;

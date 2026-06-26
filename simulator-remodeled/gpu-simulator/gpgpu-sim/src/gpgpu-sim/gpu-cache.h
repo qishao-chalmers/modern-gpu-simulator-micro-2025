@@ -1181,6 +1181,20 @@ struct cache_sub_stats {
     return ret;
   }
 
+  // Qi: per-kernel (non-cumulative) cache stat reporting -- subtract a previous
+  // cumulative snapshot from the current cumulative total to get this kernel's own delta.
+  cache_sub_stats operator-(const cache_sub_stats &cs) const {
+    cache_sub_stats ret;
+    ret.accesses = accesses - cs.accesses;
+    ret.misses = misses - cs.misses;
+    ret.pending_hits = pending_hits - cs.pending_hits;
+    ret.res_fails = res_fails - cs.res_fails;
+    ret.port_available_cycles = port_available_cycles - cs.port_available_cycles;
+    ret.data_port_busy_cycles = data_port_busy_cycles - cs.data_port_busy_cycles;
+    ret.fill_port_busy_cycles = fill_port_busy_cycles - cs.fill_port_busy_cycles;
+    return ret;
+  }
+
   void print_port_stats(FILE *fout, const char *cache_name) const;
 };
 
@@ -1852,6 +1866,9 @@ class tex_cache : public cache_t {
     return mf->get_inst().get_schd_id();
   }
   // MOD. End
+
+  // Qi: invalidate tags at kernel boundary, mirroring baseline_cache::invalidate()
+  void invalidate() { m_tags.invalidate(); }
 
   void display_state(FILE *fp) const;
 

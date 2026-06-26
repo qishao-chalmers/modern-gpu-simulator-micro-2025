@@ -153,6 +153,34 @@ class mem_fetch {
   unsigned long long get_dram_enter_cycle() const { return m_dram_enter_cycle; }
   unsigned long long get_dram_exit_cycle() const { return m_dram_exit_cycle; }
 
+  // Qi: per-request L2-partition leg timestamps, for [mem_request_trace].
+  // l2_arrival = icnt-out leg ends, request reaches the L2 partition (entry
+  // to ROP delay queue). l2_rop_done = ROP delay queue exit (enters the L2
+  // tag-array access queue). l2_access_done = L2 hit/miss resolved, request
+  // pushed toward the return icnt leg. Together with the existing send/resp
+  // timestamps these split the round trip into: icnt-out, ROP wait, L2
+  // queue+access, icnt-back.
+  void set_l2_arrival_cycle(unsigned long long t) { m_l2_arrival_cycle = t; }
+  void set_l2_rop_done_cycle(unsigned long long t) { m_l2_rop_done_cycle = t; }
+  // Qi: cycle the request is first ACCEPTED out of m_icnt_L2_queue (HIT reply
+  // or miss accepted into m_L2_dram_queue). Set once; RESERVATION_FAIL retries
+  // leave it at the sentinel until the request finally succeeds. This splits
+  // the old l2_queue_access leg into queue_wait (l2_dequeue - l2_rop_done, i.e.
+  // FIFO head-of-line + MSHR-merge spin) and service (l2_access_done -
+  // l2_dequeue, i.e. tag access + DRAM round trip).
+  void set_l2_dequeue_cycle(unsigned long long t) {
+    if (m_l2_dequeue_cycle == (unsigned long long)-1) m_l2_dequeue_cycle = t;
+  }
+  void set_l2_access_done_cycle(unsigned long long t) {
+    m_l2_access_done_cycle = t;
+  }
+  unsigned long long get_l2_arrival_cycle() const { return m_l2_arrival_cycle; }
+  unsigned long long get_l2_rop_done_cycle() const { return m_l2_rop_done_cycle; }
+  unsigned long long get_l2_dequeue_cycle() const { return m_l2_dequeue_cycle; }
+  unsigned long long get_l2_access_done_cycle() const {
+    return m_l2_access_done_cycle;
+  }
+
   enum mem_access_type get_access_type() const { return m_access.get_type(); }
   const active_mask_t &get_access_warp_mask() const {
     return m_access.get_warp_mask();
@@ -258,6 +286,13 @@ class mem_fetch {
   // set_dram_exit_cycle/went_to_dram above. Sentinel -1 = never entered DRAM.
   unsigned long long m_dram_enter_cycle = (unsigned long long)-1;
   unsigned long long m_dram_exit_cycle = (unsigned long long)-1;
+
+  // Qi: per-request L2-partition leg timestamps, see set_l2_arrival_cycle/
+  // set_l2_rop_done_cycle/set_l2_access_done_cycle above.
+  unsigned long long m_l2_arrival_cycle = (unsigned long long)-1;
+  unsigned long long m_l2_rop_done_cycle = (unsigned long long)-1;
+  unsigned long long m_l2_dequeue_cycle = (unsigned long long)-1;
+  unsigned long long m_l2_access_done_cycle = (unsigned long long)-1;
 
   // requesting instruction (put last so mem_fetch prints nicer in gdb)
   warp_inst_t m_inst;

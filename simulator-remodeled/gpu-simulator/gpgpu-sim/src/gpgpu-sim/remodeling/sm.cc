@@ -558,6 +558,9 @@ void SM::maybe_record_register_bypass_early(warp_inst_t *instruction, operation_
 void SM::instruction_retirement(warp_inst_t *instruction) {
   unsigned int warp_id = instruction->warp_id();
   print_sync_instruction_debug(this, instruction, "commit");
+  // Qi: cumulative per-op_type committed-instruction count, this SM, always on --
+  // aggregated/snapshotted in gpgpu_sim for the committed_inst_type_count stats.
+  m_committed_inst_type_count[(int)instruction->op]++;
   // Qi: per-warp committed-instruction tracing for SM0, all warps (-subcore_issue_debug 1)
   if (m_config->subcore_issue_debug && m_sm_id == 0) {
     unsigned long long commit_cycle = m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;

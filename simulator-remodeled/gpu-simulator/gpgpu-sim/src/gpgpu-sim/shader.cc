@@ -2585,11 +2585,19 @@ void ldst_unit::fill(mem_fetch *mf) {
 void ldst_unit::flush() {
   // Flush L1D cache
   m_L1D->flush();
+  // Flush L1C cache
+  m_L1C->flush();
+  // L1T (texture) is read-only and has no flush(), only invalidate()
+  m_L1T->invalidate();
 }
 
 void ldst_unit::invalidate() {
   // Flush L1D cache
   m_L1D->invalidate();
+  // Flush L1C cache
+  m_L1C->invalidate();
+  // Flush L1T cache
+  m_L1T->invalidate();
 }
 
 simd_function_unit::simd_function_unit(const shader_core_config *config) {
@@ -3108,6 +3116,27 @@ void gpgpu_sim::shader_print_scheduler_stat(FILE *fout,
   fprintf(fout, "\n");
 }
 
+// Qi: per-kernel (non-cumulative) cache stat reporting -- the various *_total_cache_*
+// counters above are cumulative since simulation start (the underlying per-cache counters
+// are never reset between kernels); this prints just the delta since the last call (i.e.
+// this kernel's own contribution) and updates the snapshot for next time.
+static void print_per_kernel_cache_delta(FILE *fout, const char *prefix,
+                                         const struct cache_sub_stats &total_css,
+                                         struct cache_sub_stats &last_snapshot) {
+  struct cache_sub_stats delta = total_css - last_snapshot;
+  fprintf(fout, "\t%s_this_kernel_cache_accesses = %llu\n", prefix, delta.accesses);
+  fprintf(fout, "\t%s_this_kernel_cache_misses = %llu\n", prefix, delta.misses);
+  if (delta.accesses > 0) {
+    fprintf(fout, "\t%s_this_kernel_cache_miss_rate = %.4lf\n", prefix,
+            (double)delta.misses / (double)delta.accesses);
+  }
+  fprintf(fout, "\t%s_this_kernel_cache_pending_hits = %llu\n", prefix,
+          delta.pending_hits);
+  fprintf(fout, "\t%s_this_kernel_cache_reservation_fails = %llu\n", prefix,
+          delta.res_fails);
+  last_snapshot = total_css;
+}
+
 void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
   // L1I
   struct cache_sub_stats total_css;
@@ -3134,6 +3163,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL0I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_per_kernel_cache_delta(fout, "L0I", total_css, m_last_kernel_L0I_css);
   }
   // MOD. End. L0I
 
@@ -3155,6 +3185,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1I_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_per_kernel_cache_delta(fout, "L1I", total_css, m_last_kernel_L1I_css);
   }
 
   // L1D
@@ -3185,6 +3216,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
     fprintf(fout, "\tL1D_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
     total_css.print_port_stats(fout, "\tL1D_cache");
+    print_per_kernel_cache_delta(fout, "L1D", total_css, m_last_kernel_L1D_css);
   }
 
   // L1C
@@ -3206,6 +3238,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1C_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_per_kernel_cache_delta(fout, "L1C", total_css, m_last_kernel_L1C_css);
   }
 
   // L1T
@@ -3227,6 +3260,7 @@ void gpgpu_sim::shader_print_cache_stats(FILE *fout) const {
             total_css.pending_hits);
     fprintf(fout, "\tL1T_total_cache_reservation_fails = %llu\n",
             total_css.res_fails);
+    print_per_kernel_cache_delta(fout, "L1T", total_css, m_last_kernel_L1T_css);
   }
 }
 
@@ -4891,6 +4925,18 @@ void simt_core_cluster::get_L0I_sub_stats(struct cache_sub_stats &css) const {
 }
 // MOD. End. L0I
 
+void simt_core_cluster::get_committed_inst_type_counts(
+    std::map<int, unsigned long long> &counts) const {
+  std::map<int, unsigned long long> temp_counts;
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
+    temp_counts.clear();
+    m_core[i]->get_committed_inst_type_counts(temp_counts);
+    for (std::map<int, unsigned long long>::const_iterator it = temp_counts.begin();
+         it != temp_counts.end(); ++it) {
+      counts[it->first] += it->second;
+    }
+  }
+}
 void simt_core_cluster::get_L1D_sub_stats(struct cache_sub_stats &css) const {
   struct cache_sub_stats temp_css;
   struct cache_sub_stats total_css;

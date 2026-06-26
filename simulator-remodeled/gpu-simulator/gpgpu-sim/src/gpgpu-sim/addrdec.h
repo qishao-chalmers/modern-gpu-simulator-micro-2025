@@ -64,7 +64,12 @@ class linear_to_raw_address_translation {
   void init(unsigned int n_channel, unsigned int n_sub_partition_in_channel);
 
   // accessors
-  void addrdec_tlx(new_addr_type addr, addrdec_t *tlx) const;
+  // Qi: wid/sid are optional, debug-only context (for [addrdec_trace], see
+  // addrdec.cc) -- callers outside mem_fetch construction (sweep_test,
+  // perf_memcpy_to_gpu) have no warp/core to report and leave them at the
+  // sentinel default.
+  void addrdec_tlx(new_addr_type addr, addrdec_t *tlx,
+                    unsigned wid = (unsigned)-1, unsigned sid = (unsigned)-1) const;
   new_addr_type partition_address(new_addr_type addr) const;
 
  private:

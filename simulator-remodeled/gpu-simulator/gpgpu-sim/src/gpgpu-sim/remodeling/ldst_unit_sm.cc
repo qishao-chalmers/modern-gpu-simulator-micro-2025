@@ -250,6 +250,11 @@ void ldst_unit_sm::active_lanes_in_pipeline() {
 void ldst_unit_sm::invalidate() {
   // Flush L1D cache
   m_L1D->invalidate();
+  // Qi: L1C (constant) and L1T (texture) were never invalidated here, so they
+  // accumulated state across kernel boundaries indefinitely (confirmed via
+  // cold-start vs warm-process L1C miss-rate comparison).
+  m_L1C->invalidate();
+  m_L1T->invalidate();
 }
 
 void ldst_unit_sm::shared_dispatch() {
@@ -629,6 +634,12 @@ void ldst_unit_sm::fill(mem_fetch *mf) {
 void ldst_unit_sm::flush() {
   // Flush L1D cache
   m_L1D->flush();
+  // Qi: L1C/L1T are read-only (never written by kernel code), so they never
+  // have dirty lines for a real flush to write back -- baseline_cache::flush()
+  // would be a no-op on them anyway. invalidate() is the operation that
+  // actually does something here, so use it directly.
+  m_L1C->invalidate();
+  m_L1T->invalidate();
 }
 
 void ldst_unit_sm::issue(register_set_uniptr &reg_set, unsigned int icnt_id) {

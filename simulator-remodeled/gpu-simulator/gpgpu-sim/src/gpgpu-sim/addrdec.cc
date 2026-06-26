@@ -95,7 +95,9 @@ new_addr_type linear_to_raw_address_translation::partition_address(
 }
 
 void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
-                                                    addrdec_t *tlx) const {
+                                                    addrdec_t *tlx,
+                                                    unsigned wid,
+                                                    unsigned sid) const {
   unsigned long long int addr_for_chip, rest_of_addr, rest_of_addr_high_bits;
   if (!gap) {
     tlx->chip = addrdec_packbits(addrdec_mask[CHIP], addr, addrdec_mkhigh[CHIP],
@@ -160,8 +162,9 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       // spread for the non-power-of-2 n_mem=80 case (see notes/).
       extern int g_debug_addrdec_trace;
       if (g_debug_addrdec_trace) {
-        printf("[addrdec_trace] addr=0x%llx higher_bits=0x%llx pre_hash_subpart=%u "
+        printf("[addrdec_trace] warp=%u core=%u addr=0x%llx higher_bits=0x%llx pre_hash_subpart=%u "
                "post_hash_subpart=%u chip=%u\n",
+               wid, sid,
                (unsigned long long)addr, (unsigned long long)rest_of_addr_high_bits,
                pre_hash_subpart, sub_partition, sub_partition / m_n_sub_partition_in_channel);
       }
@@ -210,6 +213,17 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
   unsigned sub_partition_addr_mask = m_n_sub_partition_in_channel - 1;
   tlx->sub_partition = tlx->chip * m_n_sub_partition_in_channel +
                        (tlx->bk & sub_partition_addr_mask);
+
+  // Qi: same one-off debug trace as the IPOLY case above, but for
+  // CONSECUTIVE/BITWISE_PERMUTATION/RANDOM(unreached)/CUSTOM -- shows which
+  // chip/sub_partition a given address lands on under the indexing mode this
+  // config actually uses (CONSECUTIVE for n_mem=80, see notes/).
+  extern int g_debug_addrdec_trace;
+  if (g_debug_addrdec_trace) {
+    printf("[addrdec_trace] warp=%u core=%u addr=0x%llx chip=%u bk=%u sub_partition=%u\n",
+           wid, sid,
+           (unsigned long long)addr, tlx->chip, tlx->bk, tlx->sub_partition);
+  }
 }
 
 void linear_to_raw_address_translation::addrdec_parseoption(

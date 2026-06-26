@@ -66,6 +66,7 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <map>
 #include <unordered_map>
 #include <utility>
 #include "../abstract_hardware_model.h"
@@ -875,6 +876,19 @@ class gpgpu_sim : public gpgpu_t {
   // kernel_id -> (base_address, size_bytes) for quantized-weight DRAM compression
   std::unordered_map<unsigned int, std::pair<unsigned long long, unsigned long long>>
       m_quantized_weight_regions;
+  // Qi: per-kernel (non-cumulative) cache-stat snapshots -- the underlying per-cache
+  // counters never reset between kernels, so to report "this kernel's own" access/miss
+  // counts we snapshot the cumulative total after each print and subtract it from the
+  // next one. mutable since shader_print_cache_stats() is const.
+  mutable struct cache_sub_stats m_last_kernel_L0I_css;
+  mutable struct cache_sub_stats m_last_kernel_L1I_css;
+  mutable struct cache_sub_stats m_last_kernel_L1D_css;
+  mutable struct cache_sub_stats m_last_kernel_L1C_css;
+  mutable struct cache_sub_stats m_last_kernel_L1T_css;
+  mutable struct cache_sub_stats m_last_kernel_L2_css;
+  // Qi: per-kernel committed-instruction-type-count snapshot (cumulative as of last print).
+  mutable std::map<int, unsigned long long> m_last_kernel_committed_inst_type_count;
+  void print_committed_inst_type_stats() const;
   void create_gpu_per_sm_stats();
   void gather_gpu_per_sm_stats();
   void reset_cycless_access_history();

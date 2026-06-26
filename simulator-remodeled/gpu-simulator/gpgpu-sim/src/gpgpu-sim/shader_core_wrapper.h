@@ -30,6 +30,7 @@
 #pragma once
 
 #include <bitset>
+#include <map>
 #include "../constants.h"
 #include "remodeling/new_stats.h"
 
@@ -117,6 +118,9 @@ class shader_core_ctx_wrapper {
   virtual void get_L1D_sub_stats(struct cache_sub_stats &css) const = 0;
   virtual void get_L1C_sub_stats(struct cache_sub_stats &css) const = 0;
   virtual void get_L1T_sub_stats(struct cache_sub_stats &css) const = 0;
+  // Qi: per-instruction-type committed-instruction counts (key = uarch_op_t/op_type value)
+  virtual void get_committed_inst_type_counts(
+      std::map<int, unsigned long long> &counts) const = 0;
   virtual void incload_stat() = 0;
   virtual void incstore_stat() = 0;
   virtual void incialu_stat(unsigned active_count, double latency) = 0;

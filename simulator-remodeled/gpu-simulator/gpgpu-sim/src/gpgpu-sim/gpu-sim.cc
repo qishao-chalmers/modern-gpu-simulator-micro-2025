@@ -3300,35 +3300,46 @@ void gpgpu_sim::cycle() {
             unsigned long long resp_t = gpu_sim_cycle + gpu_tot_sim_cycle;
             unsigned long long l2_arrival = mf->get_l2_arrival_cycle();
             unsigned long long l2_rop_done = mf->get_l2_rop_done_cycle();
+            unsigned long long l2_dequeue = mf->get_l2_dequeue_cycle();
             unsigned long long l2_access_done = mf->get_l2_access_done_cycle();
+            // Qi: split the old l2_queue_access leg into queue_wait (time spent
+            // stuck in m_icnt_L2_queue behind FIFO head-of-line / MSHR-merge
+            // RESERVATION_FAIL spinning) and service (tag access + DRAM round
+            // trip once the request is finally accepted).
+            unsigned long long queue_wait = l2_dequeue - l2_rop_done;
+            unsigned long long service = l2_access_done - l2_dequeue;
             if (mf->went_to_dram()) {
               printf(
                   "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
                   "send=%llu resp=%llu dur=%llu dram=1 dram_enter=%llu "
                   "dram_exit=%llu dram_dur=%llu l2_arrival=%llu "
-                  "l2_rop_done=%llu l2_access_done=%llu icnt_out=%llu "
-                  "rop_wait=%llu l2_queue_access=%llu icnt_back=%llu\n",
+                  "l2_rop_done=%llu l2_dequeue=%llu l2_access_done=%llu "
+                  "icnt_out=%llu rop_wait=%llu l2_queue_access=%llu "
+                  "queue_wait=%llu service=%llu icnt_back=%llu\n",
                   mf->get_wid(), (unsigned long long)mf->get_pc(),
                   (unsigned long long)mf->get_addr(),
                   mem_access_type_str(mf->get_access_type()), send_t, resp_t,
                   resp_t - send_t, mf->get_dram_enter_cycle(),
                   mf->get_dram_exit_cycle(),
                   mf->get_dram_exit_cycle() - mf->get_dram_enter_cycle(),
-                  l2_arrival, l2_rop_done, l2_access_done,
+                  l2_arrival, l2_rop_done, l2_dequeue, l2_access_done,
                   l2_arrival - send_t, l2_rop_done - l2_arrival,
-                  l2_access_done - l2_rop_done, resp_t - l2_access_done);
+                  l2_access_done - l2_rop_done, queue_wait, service,
+                  resp_t - l2_access_done);
             } else {
               printf(
                   "[mem_request_trace] warp=%u pc=0x%llx addr=0x%llx type=%s "
                   "send=%llu resp=%llu dur=%llu dram=0 l2_arrival=%llu "
-                  "l2_rop_done=%llu l2_access_done=%llu icnt_out=%llu "
-                  "rop_wait=%llu l2_queue_access=%llu icnt_back=%llu\n",
+                  "l2_rop_done=%llu l2_dequeue=%llu l2_access_done=%llu "
+                  "icnt_out=%llu rop_wait=%llu l2_queue_access=%llu "
+                  "queue_wait=%llu service=%llu icnt_back=%llu\n",
                   mf->get_wid(), (unsigned long long)mf->get_pc(),
                   (unsigned long long)mf->get_addr(),
                   mem_access_type_str(mf->get_access_type()), send_t, resp_t,
-                  resp_t - send_t, l2_arrival, l2_rop_done, l2_access_done,
-                  l2_arrival - send_t, l2_rop_done - l2_arrival,
-                  l2_access_done - l2_rop_done, resp_t - l2_access_done);
+                  resp_t - send_t, l2_arrival, l2_rop_done, l2_dequeue,
+                  l2_access_done, l2_arrival - send_t, l2_rop_done - l2_arrival,
+                  l2_access_done - l2_rop_done, queue_wait, service,
+                  resp_t - l2_access_done);
             }
           }
           ::icnt_push(m_shader_config->mem2device(i), mf->get_tpc(), mf,

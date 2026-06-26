@@ -493,6 +493,8 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
         mf->set_reply();
         mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        mf->set_l2_access_done_cycle(m_gpu->gpu_sim_cycle +
+                                     m_gpu->gpu_tot_sim_cycle);
         m_L2_icnt_queue->push(mf);
       } else {
         if (m_config->m_L2_config.m_write_alloc_policy == FETCH_ON_WRITE) {
@@ -501,6 +503,8 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
           original_wr_mf->set_reply();
           original_wr_mf->set_status(
               IN_PARTITION_L2_TO_ICNT_QUEUE,
+              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+          original_wr_mf->set_l2_access_done_cycle(
               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
           m_L2_icnt_queue->push(original_wr_mf);
         }
@@ -557,6 +561,14 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
         MEM_SUBPART_DPRINTF("Probing L2 cache Address=%llx, status=%u\n",
                             mf->get_addr(), status);
 
+        // Qi: request is leaving m_icnt_L2_queue this cycle (anything but a
+        // RESERVATION_FAIL spin). Stamp the dequeue time so [mem_request_trace]
+        // can separate FIFO/MSHR-merge queue_wait from L2+DRAM service time.
+        if (status != RESERVATION_FAIL) {
+          mf->set_l2_dequeue_cycle(m_gpu->gpu_sim_cycle +
+                                   m_gpu->gpu_tot_sim_cycle);
+        }
+
         if (status == HIT) {
           if (!write_sent) {
             // L2 cache replies
@@ -568,6 +580,8 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
               mf->set_reply();
               mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+              mf->set_l2_access_done_cycle(m_gpu->gpu_sim_cycle +
+                                           m_gpu->gpu_tot_sim_cycle);
               m_L2_icnt_queue->push(mf);
             }
             m_icnt_L2_queue->pop();
@@ -588,6 +602,8 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
               mf->set_reply();
               mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+              mf->set_l2_access_done_cycle(m_gpu->gpu_sim_cycle +
+                                           m_gpu->gpu_tot_sim_cycle);
               m_L2_icnt_queue->push(mf);
             }
           }
@@ -616,6 +632,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
     m_icnt_L2_queue->push(mf);
     mf->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE,
                    m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    mf->set_l2_rop_done_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
   }
 }
 
@@ -817,14 +834,27 @@ void memory_sub_partition::push(mem_fetch *m_req, unsigned long long cycle) {
     for (unsigned i = 0; i < reqs.size(); ++i) {
       mem_fetch *req = reqs[i];
       m_request_tracker.insert(req);
+      req->set_l2_arrival_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       if (req->istexture()) {
         m_icnt_L2_queue->push(req);
         req->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE,
                         m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        req->set_l2_rop_done_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       } else {
         rop_delay_t r;
         r.req = req;
-        r.ready_cycle = cycle + m_config->rop_latency;
+        // Qi: constant-cache bypass ROP latency (enabled by -gpgpu_const_cache_bypass_l2):
+        // real H100 likely has dedicated fast path for read-only constant memory,
+        // model as minimal (1-cycle) overhead vs full ROP pipeline (220 cycles) for
+        // global/other accesses. Use get_access_type() not isconst() to handle sector
+        // splits: isconst() checks m_inst which is NULL for cloned requests, but
+        // get_access_type() reads m_access which survives sector splits.
+        unsigned rop_delay = m_config->rop_latency;
+        if (m_gpu->getShaderCoreConfig()->gpgpu_const_cache_bypass_l2 &&
+            req->get_access_type() == CONST_ACC_R) {
+          rop_delay = 1;
+        }
+        r.ready_cycle = cycle + rop_delay;
         m_rop.push(r);
         req->set_status(IN_PARTITION_ROP_DELAY,
                         m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
