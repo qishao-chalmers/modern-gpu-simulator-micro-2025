@@ -44,6 +44,32 @@ static new_addr_type addrdec_packbits(new_addr_type mask, new_addr_type val,
 static void addrdec_getmasklimit(new_addr_type mask, unsigned char *high,
                                  unsigned char *low);
 
+// Qi: helpers for the MIXMOD partition-index mode (even, stride-robust,
+// bijective channel map for non-power-of-2 channel counts, e.g. H100 n_mem=80).
+//
+// splitmix64 finalizer -- a strong *non-linear* mix (xorshift + odd multiplies)
+// so that structured / power-of-2-strided address streams become statistically
+// uniform before reduction. (Pure xorshift is GF(2)-linear and can leave stride
+// structure intact; the multiplies are what break it.)
+static inline unsigned long long addrdec_mix64(unsigned long long x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+
+// Lemire fastmod: returns n % d for 32-bit n using a precomputed
+// M = floor(2^64 / d) + 1, i.e. without a runtime integer division. Exact for
+// all 32-bit n; d may be any (non-power-of-2) channel count.
+static inline unsigned int addrdec_fastmod_u32(unsigned int n, unsigned int d,
+                                               unsigned long long M) {
+  unsigned long long lowbits = M * (unsigned long long)n;
+  return (unsigned int)(((unsigned __int128)lowbits * (unsigned long long)d) >>
+                        64);
+}
+
 linear_to_raw_address_translation::linear_to_raw_address_translation() {
   addrdec_option = NULL;
   ADDR_CHIP_S = 10;
@@ -73,7 +99,9 @@ void linear_to_raw_address_translation::addrdec_setoption(option_parser_t opp) {
   option_parser_register(
       opp, "-gpgpu_memory_partition_indexing", OPT_UINT32,
       &memory_partition_indexing,
-      "0 = no indexing, 1 = bitwise xoring, 2 = IPoly, 3 = custom indexing",
+      "0 = no indexing (consecutive), 1 = bitwise xoring, 2 = IPoly, 4 = random, "
+      "5 = custom, 6 = MIXMOD (even+bijective rotation hash for non-power-of-2 "
+      "channel counts, e.g. n_mem=80)",
       "0");
 }
 
@@ -199,6 +227,32 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       return;
       break;
     }
+    case MIXMOD: {
+      // Even, stride-robust, *bijective* channel map for non-power-of-2 channel
+      // counts (e.g. H100 n_mem=80 = 2^4*5). Plain CONSECUTIVE (chip = X % n,
+      // X = addr>>ADDR_CHIP_S) camps on gcd(stride,n) channels under power-of-2
+      // strides; a naive chip = mix(X) % n would spread evenly but *aliases*
+      // distinct addresses onto the same DRAM chip/row/col (not a bijection).
+      //
+      // Instead rotate the consecutive channel c0 by a strong hash of the higher
+      // address bits q:   chip = (c0 + mix(q)) mod n,  where c0 = X % n, q = X / n.
+      // This is a bijection: q is preserved in the partition-local address
+      // (partition_address(), gap branch), so c0 = (chip - mix(q)) mod n and thus
+      // X = q*n + c0 are recoverable -- no aliasing. The rotation decorrelates
+      // power-of-2 strides (mix(q) changes as the high bits advance) while keeping
+      // the per-channel address layout (bank/row/col) and the L2 set index (power
+      // of 2, computed downstream from the partition-local address) untouched.
+      new_addr_type X = addr >> ADDR_CHIP_S;
+      unsigned c0 = (unsigned)(X % m_n_channel);
+      new_addr_type q = X / m_n_channel;
+      unsigned rot = addrdec_fastmod_u32((unsigned)addrdec_mix64(q),
+                                         m_n_channel, m_fastmod_M);
+      unsigned c = c0 + rot;
+      if (c >= m_n_channel) c -= m_n_channel;  // (c0 + rot) mod n, both < n
+      tlx->chip = c;
+      assert(tlx->chip < m_n_channel);
+      break;
+    }
     case CUSTOM:
       /* No custom set function implemented */
       // Do you custom index here
@@ -315,6 +369,8 @@ void linear_to_raw_address_translation::init(
   m_n_channel = n_channel;
   m_n_sub_partition_in_channel = n_sub_partition_in_channel;
   nextPowerOf2_m_n_channel = ::next_powerOf2(n_channel);
+  // Qi: Lemire fastmod magic for the MIXMOD mode (M = floor(2^64/n)+1).
+  m_fastmod_M = (unsigned long long)(-1) / n_channel + 1;
   m_n_sub_partition_total = n_channel * n_sub_partition_in_channel;
 
   gap = (n_channel - ::powli(2, nchipbits));

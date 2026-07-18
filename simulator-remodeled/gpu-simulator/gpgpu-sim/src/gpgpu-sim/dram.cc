@@ -279,7 +279,7 @@ void dram_t::push(class mem_fetch *data) {
   if (qw_cfg.is_quantized_weight_dram_compression_enabled && !data->get_is_write() &&
       data->get_original_data_size() == 0) {
     unsigned long long region_base = 0, region_size = 0;
-    if (m_gpu->get_quantized_weight_region(data->get_kernel_id(), region_base,
+    if (m_gpu->get_quantized_weight_region(data->get_trace_kernel_id(), region_base,
                                            region_size) &&
         data->get_addr() >= region_base &&
         data->get_addr() < region_base + region_size) {
@@ -287,6 +287,11 @@ void dram_t::push(class mem_fetch *data) {
       unsigned compressed_size =
           (real_size * (unsigned)qw_cfg.quantized_weight_compression_bits + 7) / 8;
       if (compressed_size < 1) compressed_size = 1;
+      // Qi: debug print of compressed size and real size
+      //printf("dram_t %s kernel id: %d, address: %lx, Compressed size: %d, Real size: %d\n",
+            //__func__,
+            //data->get_trace_kernel_id(),
+            //(unsigned long)data->get_addr(), compressed_size, real_size);
       data->set_original_data_size(real_size);
       data->set_data_size(compressed_size);
     }

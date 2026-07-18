@@ -13,6 +13,8 @@
 
 //#include "volta_TITANV_hw_def.h"
 
-#include "ada_RTX4090_hw_def.h"
+//#include "ada_RTX4090_hw_def.h"
+
+#include "hopper_H100_hw_def.h"
 
 #endif

@@ -76,6 +76,7 @@ mem_fetch *partition_mf_allocator::alloc(
   // inherit the trace kernel id from the parent request instead of losing it here.
   if (original_mf) {
     mf->set_kernel_id(original_mf->get_kernel_id());
+    mf->set_trace_kernel_id(original_mf->get_trace_kernel_id());
   }
   return mf;
 }
@@ -303,6 +304,12 @@ void memory_partition_unit::simple_dram_model_cycle() {
       d.ready_cycle = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
                       m_config->dram_latency;
       m_dram_latency_queue.push_back(d);
+
+      // Qi: debug print of kernel id, address,original data size and compressed data size,
+      //printf("simple_dram_model_cycle %s kernel id: %d, address: %lx, original data size: %d, compressed data size: %d\n",
+             //__func__,
+             //mf->get_trace_kernel_id(), mf->get_addr(), mf->get_original_data_size(), mf->get_data_size());
+
       mf->set_status(IN_PARTITION_DRAM_LATENCY_QUEUE,
                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
       mf->set_dram_enter_cycle(m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
@@ -825,6 +832,11 @@ memory_sub_partition::breakdown_request_to_sector_requests(mem_fetch *mf) {
 void memory_sub_partition::push(mem_fetch *m_req, unsigned long long cycle) {
   if (m_req) {
     m_stats->memlatstat_icnt2mem_pop(m_req);
+
+    // Qi: debug print of kernel id, address,original data size and compressed data size,
+    //printf("memory_sub_partition %s kernel id: %d, address: %lx, original data size: %d, compressed data size: %d\n",
+    //      __func__,
+    //       m_req->get_trace_kernel_id(), m_req->get_addr(), m_req->get_original_data_size(), m_req->get_data_size());
     std::vector<mem_fetch *> reqs;
     if (m_config->m_L2_config.m_cache_type == SECTOR)
       reqs = breakdown_request_to_sector_requests(m_req);

@@ -12,17 +12,21 @@ GENCODE_SM75 ?= -gencode=arch=compute_75,code=\"sm_75,compute_75\"
 GENCODE_SM80 ?= -gencode=arch=compute_80,code=\"sm_80,compute_80\"
 GENCODE_SM86 ?= -gencode=arch=compute_86,code=\"sm_86,compute_86\"
 GENCODE_SM89 ?= -gencode=arch=compute_89,code=\"sm_89,compute_89\"
+GENCODE_SM90 ?= -gencode=arch=compute_90,code=\"sm_90,compute_90\"
 
-CUOPTS =  $(GENCODE_ARCH) $(GENCODE_SM50) $(GENCODE_SM60) $(GENCODE_SM62) $(GENCODE_SM70) $(GENCODE_SM72) $(GENCODE_SM75) $(GENCODE_SM80) $(GENCODE_SM86)  $(GENCODE_SM89)
+CUOPTS =  $(GENCODE_ARCH) $(GENCODE_SM50) $(GENCODE_SM60) $(GENCODE_SM62) $(GENCODE_SM70) $(GENCODE_SM72) $(GENCODE_SM75) $(GENCODE_SM80) $(GENCODE_SM86)  $(GENCODE_SM89) $(GENCODE_SM90)
 
 CC := nvcc
 
 CUDA_PATH ?= /usr/local/cuda
-INCLUDE := $(CUDA_PATH)/samples/common/inc/
-LIB := 
+# CUDA 12 removed the bundled samples (helper_cuda.h / helper_string.h). The suite vendors
+# its own copies under hw_def/common/, so include from there instead of the (now missing)
+# $(CUDA_PATH)/samples/common/inc. BASE_DIR is the bench dir (ubench/*/*/); up 3 = the suite root.
+INCLUDE := $(BASE_DIR)/../../../hw_def/common
+LIB :=
 
 release:
-	$(CC) $(NVCC_FLGAS) $(CUOPTS) $(SRC) -o $(EXE) -I$(INCLUDE) -L$(LIB) -lcudart   -I/usr/local/cuda/samples/common/inc
+	$(CC) $(NVCC_FLGAS) $(CUOPTS) $(SRC) -o $(EXE) -I$(INCLUDE) -L$(LIB) -lcudart
 	cp $(EXE) $(BIN_DIR)
 
 clean:

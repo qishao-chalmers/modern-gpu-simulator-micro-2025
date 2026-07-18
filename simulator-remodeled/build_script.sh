@@ -1,0 +1,3 @@
+ARCH=sm_90 SIM_ONLY=1 ACCELSIM_CONFIG=debug BUILD_SYSTEM=cmake ./build.sh
+
+ARCH=sm_90 ACCELSIM_CONFIG=debug BUILD_SYSTEM=cmake ./build.sh

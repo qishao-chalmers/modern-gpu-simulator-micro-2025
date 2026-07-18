@@ -820,6 +820,13 @@ unsigned int SM::get_kernel_id(unsigned warp_id) {
   return m_physical_warp[warp_id]->m_kernel_id;
 }
 
+// Qi: absolute trace kernel id (e.g. 2668) of the kernel resident on this warp, for the
+// quantized-weight DRAM compression region lookup. Distinct from get_kernel_id() above,
+// which returns the relative launch uid the grid-barrier subsystem relies on.
+unsigned int SM::get_trace_kernel_id(unsigned warp_id) {
+  return m_physical_warp[warp_id]->get_kernel_info()->get_trace_kernel_id();
+}
+
 void SM::init_warps(unsigned cta_id, unsigned start_thread, unsigned end_thread,
                     unsigned ctaid, int cta_size, kernel_info_t &kernel) {
   address_type start_pc = next_pc(start_thread);

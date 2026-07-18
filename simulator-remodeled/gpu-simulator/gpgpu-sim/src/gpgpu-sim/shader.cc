@@ -120,6 +120,7 @@ mem_fetch *shader_core_mem_fetch_allocator::alloc(
   // so inherit the trace kernel id from the parent request rather than re-deriving it.
   if (original_mf) {
     mf->set_kernel_id(original_mf->get_kernel_id());
+    mf->set_trace_kernel_id(original_mf->get_trace_kernel_id());
   }
   return mf;
 }
@@ -2284,6 +2285,26 @@ void shader_core_ctx::warp_inst_complete(const warp_inst_t &inst) {
   m_stats->m_num_sim_winsn_per_shader[m_sid]++; // MOD. Custom Stats
 
   m_gpu->gpu_sim_insn += inst.active_count();
+  // ---- live progress tick: env GPGPUSIM_INSN_TICK=N prints (cycle, committed insn) every N
+  //      instructions (default 1M if set to a non-positive value). Lets you watch IPC/throughput
+  //      mid-run without waiting for completion. Off unless the env is set.
+  {
+    static long long tick_interval = -1;      // -1 = not yet read; 0 = disabled
+    static unsigned long long next_tick = 0;
+    if (tick_interval < 0) {
+      const char *e = getenv("GPGPUSIM_INSN_TICK");
+      tick_interval = e ? (atoll(e) > 0 ? atoll(e) : 1000000LL) : 0;
+    }
+    if (tick_interval > 0) {
+      unsigned long long tot_insn = m_gpu->gpu_tot_sim_insn + m_gpu->gpu_sim_insn;
+      if (tot_insn >= next_tick) {
+        printf("[INSN_TICK] cycle=%llu insn=%llu\n",
+               (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle), tot_insn);
+        fflush(stdout);
+        next_tick = tot_insn + (unsigned long long)tick_interval;
+      }
+    }
+  }
   inst.completed(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
   customStatsWarpActiveLanes(inst); // MOD. Custom Stats
 }

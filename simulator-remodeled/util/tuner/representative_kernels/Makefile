@@ -9,7 +9,7 @@
 # or you hit the "app must be compiled with same major version as the simulator" assertion.
 # (mul_mat_vec_q omitted: its Makefile has no exec target; the sweep uses mmvq_bitwidth for the
 #  software gemv and mul_mat_q for the software gemm.)
-SUBDIRS = mmvq_bitwidth mul_mat_q rms_norm quantize_q8_1 flash_attn rope set_rows swiglu add
+SUBDIRS = mmvq_kquant mmvq_bitwidth mul_mat_q rms_norm quantize_q8_1 flash_attn rope set_rows swiglu add
 
 .PHONY: all exec run clean compile $(SUBDIRS)
 

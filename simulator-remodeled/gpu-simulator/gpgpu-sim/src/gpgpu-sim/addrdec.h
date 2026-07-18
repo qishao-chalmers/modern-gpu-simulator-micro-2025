@@ -42,7 +42,9 @@ enum partition_index_function {
   IPOLY,
   PAE,
   RANDOM,
-  CUSTOM
+  CUSTOM,
+  MIXMOD  // even, stride-robust, bijective map for non-power-of-2 channel counts
+          // (e.g. H100 n_mem=80): chip = (c0 + mix(high_bits)) mod n_channel
 };
 
 struct addrdec_t {
@@ -96,6 +98,10 @@ class linear_to_raw_address_translation {
   unsigned log2channel;
   unsigned log2sub_partition;
   unsigned nextPowerOf2_m_n_channel;
+  // Qi: precomputed Lemire fastmod multiplier M = floor(2^64 / m_n_channel) + 1,
+  // used by the MIXMOD indexing mode to reduce a 32-bit hash to [0, m_n_channel)
+  // without a runtime integer division.
+  unsigned long long m_fastmod_M;
 };
 
 #endif

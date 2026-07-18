@@ -198,6 +198,10 @@ class SM : public core_t, public shader_core_ctx_wrapper {
   unsigned int get_sid() const override;
   unsigned int get_tpc_id() const;
   unsigned int get_kernel_id(unsigned warp_id);
+  // Qi: absolute trace kernel id of the kernel resident on this warp (for the
+  // quantized-weight DRAM compression lookup). get_kernel_id() above returns the
+  // relative launch uid used by grid barriers -- keep them distinct.
+  unsigned int get_trace_kernel_id(unsigned warp_id);
   gpgpu_sim *get_gpu() override;
   shader_core_mem_fetch_allocator &get_memf_fetch_allocator();
   read_only_cache *get_L1C();

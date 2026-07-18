@@ -3031,6 +3031,8 @@ class shader_core_mem_fetch_allocator : public mem_fetch_allocator {
     // this core, so dram_t::push() can look it up in the weight-region table.
     if (m_owning_core && m_owning_core->get_kernel_info()) {
       mf->set_kernel_id(m_owning_core->get_kernel_info()->get_trace_kernel_id());
+      // Qi: also tag the dedicated absolute-id field used by the weight-region lookup.
+      mf->set_trace_kernel_id(m_owning_core->get_kernel_info()->get_trace_kernel_id());
     }
     return mf;
   }

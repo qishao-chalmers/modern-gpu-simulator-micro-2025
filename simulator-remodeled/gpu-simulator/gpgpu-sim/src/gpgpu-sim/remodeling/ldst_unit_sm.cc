@@ -1105,6 +1105,9 @@ void ldst_unit_sm::execute_miscellaneous_dispatch() {
         mem_fetch *mf =
             m_mf_allocator->alloc(*(acc->get_inst()), *acc,m_sm->get_current_gpu_cycle());
         mf->set_kernel_id(m_sm->get_kernel_id(acc->get_inst()->warp_id()));
+        // Qi: also tag the absolute trace kernel id for the weight-region lookup
+        // (set_kernel_id above carries the relative uid for grid barriers).
+        mf->set_trace_kernel_id(m_sm->get_trace_kernel_id(acc->get_inst()->warp_id()));
         m_icnt->push(mf);
       }
     }

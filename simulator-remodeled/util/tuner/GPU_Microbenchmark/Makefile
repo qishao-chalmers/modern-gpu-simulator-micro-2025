@@ -1,7 +1,7 @@
 
 BASE_DIR := $(shell pwd)
 BIN_DIR := $(BASE_DIR)/bin
-SUB_DIRS        = $(wildcard ubench/*/*/)
+SUB_DIRS        = $(dir $(wildcard ubench/*/*/Makefile))
 SUB_DIRS_ALL    = $(SUB_DIRS:%=all-%)
 SUB_DIRS_CLEAN  = $(SUB_DIRS:%=clean-%)
 

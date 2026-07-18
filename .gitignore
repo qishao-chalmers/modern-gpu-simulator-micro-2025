@@ -1,0 +1,29 @@
+# editor / build cache
+.cache/
+.clangd
+.vscode/
+compile_commands.json
+*.swp
+*.swo
+
+# profiling data (large)
+h100_real_profile/
+simulator-remodeled/profile_real_machine/
+
+# compiled binaries / objects
+*.o
+*.so
+*_exec
+*_exec_dp8a
+simulator-remodeled/util/tuner/representative_kernels/*/mmvq_kquant
+simulator-remodeled/util/tuner/representative_kernels/*/mmvq_kquant_4bit
+simulator-remodeled/util/tracer_nvbit/tracer_tool/assemble_dynamic_trace
+
+# logs
+*.log
+*.sw?
+gpgpu_inst_stats.txt
+k3_sass_decoded.txt
+simulator-remodeled/log
+# stray compiled ubench binaries (named after their dir)
+config_tensor_imma16832/config_tensor_imma16832

@@ -87,6 +87,7 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
   m_is_prefetch = false;
   m_stream_buffer_id = std::numeric_limits<unsigned int>::max();
   m_kernel_id = 0;
+  m_trace_kernel_id = (unsigned int)-1;  // sentinel: unset; never matches a real kernel id
 
   m_tlb_set_idx = -1;
   m_tlb_way_idx = -1;

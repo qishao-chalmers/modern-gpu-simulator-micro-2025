@@ -234,6 +234,14 @@ class mem_fetch {
   void set_kernel_id(unsigned int kernel_id) { m_kernel_id = kernel_id; }
   unsigned int get_kernel_id() { return m_kernel_id; }
 
+  // Qi: absolute trace kernel id (e.g. 2668), kept SEPARATE from m_kernel_id. m_kernel_id
+  // carries the relative launch uid the grid-barrier subsystem relies on
+  // (register_grid_barrier_arrivement / clear_gridbar); the quantized-weight DRAM
+  // compression region lookup (dram.cc) needs the absolute trace id instead. Default
+  // sentinel (unsigned)-1 means "unset" so it never spuriously matches kernel 0.
+  void set_trace_kernel_id(unsigned int id) { m_trace_kernel_id = id; }
+  unsigned int get_trace_kernel_id() { return m_trace_kernel_id; }
+
   void set_tlb_way_idx(unsigned int tlb_way_idx) { m_tlb_way_idx = tlb_way_idx; }
   int get_tlb_way_idx() { return m_tlb_way_idx; }
   void set_tlb_set_idx(unsigned int tlb_set_idx) { m_tlb_set_idx = tlb_set_idx; }
@@ -248,6 +256,7 @@ class mem_fetch {
   unsigned m_tpc;
   unsigned m_wid;
   unsigned int m_kernel_id;
+  unsigned int m_trace_kernel_id;
 
   int m_subcore; // MOD. Added L0I
   bool m_is_filling_L0; // MOD. Added L0I
