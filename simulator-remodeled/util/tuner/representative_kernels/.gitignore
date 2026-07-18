@@ -1,0 +1,33 @@
+# Build outputs (native + GPGPU-Sim exec binaries)
+*_exec
+*_nodequant_exec
+*_dp4a_exec
+**/mmvq_bitwidth/mmvq_bitwidth
+**/mul_mat_vec_q/mmvq_bench
+**/mul_mat_vec_q/mmvq_bench_funcsim
+**/mul_mat_q/mmq_bench
+**/quantize_q8_1/quantize_bench
+**/flash_attn/flash_attn_bench
+**/rms_norm/rms_norm_bench
+**/rope/rope_bench
+**/set_rows/set_rows_bench
+**/swiglu/swiglu_bench
+**/add/add_bench
+
+# GPGPU-Sim / cuobjdump artifacts from local runs
+_app_cuda_version_*
+_cuobjdump_*
+*.ptx
+*.ptxas
+gpgpu_inst_stats.txt
+gpgpusim.config
+config_*.icnt
+accelwattch_*.xml
+
+# Local sim logs / result dumps (keep RESULTS.md summary)
+results/
+
+# Editor swap
+*.swp
+*.swo
+.Makefile.swp
