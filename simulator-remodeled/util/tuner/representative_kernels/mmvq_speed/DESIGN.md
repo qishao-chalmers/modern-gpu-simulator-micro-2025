@@ -116,26 +116,29 @@ MMVQ_NO_TIME=1 MMVQ_SKIP_FILL=1 MMVQ_TINY=1
 
 ## Compare harness (`test_compare`)
 
-Separate binary — does **not** rewrite kernel logic. `#include`s `mmvq_speed.cu` with
-`MMVQ_NO_MAIN` and runs one shared `W`/`y` through:
-
-| Path | Meaning |
-|------|---------|
-| fp32 GEMV | numeric reference |
-| Q8_0 packed (`mmvq_q8_packed`) | same math as `../mmvq_kquant/mmvq_kquant K N q8_0` |
-| SPEED mode 1 | striped Q-only |
-| SPEED mode 2 | striped Q+R rebuild |
-
-Reports **max/mean/RMSE** error (vs fp32 and vs Q8) and **µs / GB/s**.
-
 ```bash
 make test_compare
-./test_compare 8 q4_k q4_k 8192 8192
-MMVQ_SEED=42 ./test_compare 8 q4_k q4_k 1024 256
+./test_compare <G> <q> <r> <baseline> <K> <N>
 ```
 
-(Linking `mmvq_kquant.cu` and `mmvq_speed.cu` in one binary clashes on fill kernels /
-types; the Q8 kernel here is the intentional stand-in for kquant Q8_0.)
+| Arg | Meaning |
+|-----|---------|
+| `q`,`r` | SPEED quant / residual (`q2_k`/`q3_k`/`q4_k`) |
+| `baseline` | Packed kquant reference (`q8_0`/`q2_k`/`q3_k`/`q4_k`) — **configurable** |
+
+Reports:
+
+1. vs **fp32** — baseline, packed same-Q, mode1, mode2  
+2. vs **baseline** — mode1, mode2 (e.g. Q2+R2 vs Q4 full, or Q4+R4 vs Q8)  
+3. **mode1 vs packed same-Q** — expect **~0** (layout-only; ≡ `mmvq_kquant` at that quant)  
+4. Speeds for all paths  
+
+```bash
+./test_compare 8 q4_k q4_k q8_0 8192 8192   # mode2 vs Q8 “full”
+./test_compare 8 q2_k q2_k q4_k 8192 8192   # Q2+R2 vs Q4 full model
+./test_compare 8 q4_k q4_k q4_k 8192 8192   # mode1 exact-match vs packed q4
+MMVQ_SEED=42 ./test_compare 8 q4_k q4_k q8_0 1024 256
+```
 
 ## Status
 
