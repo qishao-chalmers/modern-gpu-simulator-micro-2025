@@ -299,19 +299,30 @@ __global__ void mmvq_packed_kquant(const char *__restrict__ vx,
 #endif
 }
 
-struct err_stats { double max_abs, mean_abs, rmse; };
+struct err_stats {
+    double max_abs, mean_abs, rmse;
+    double max_rel, mean_rel, rmse_rel;  // |a-b| / max(|b|, eps); print as %
+};
 
 static err_stats diff_stats(const float *a, const float *b, int n) {
-    err_stats e{0, 0, 0};
-    double sum = 0, sum2 = 0;
+    err_stats e{};
+    double sum = 0, sum2 = 0, sum_r = 0, sum_r2 = 0;
+    const double eps = 1e-8;
     for (int i = 0; i < n; ++i) {
         const double d = fabs((double)a[i] - (double)b[i]);
+        const double denom = fmax(fabs((double)b[i]), eps);
+        const double r = d / denom;
         if (d > e.max_abs) e.max_abs = d;
+        if (r > e.max_rel) e.max_rel = r;
         sum += d;
         sum2 += d * d;
+        sum_r += r;
+        sum_r2 += r * r;
     }
     e.mean_abs = sum / n;
     e.rmse = sqrt(sum2 / n);
+    e.mean_rel = sum_r / n;
+    e.rmse_rel = sqrt(sum_r2 / n);
     return e;
 }
 
@@ -359,8 +370,10 @@ static void launch_speed(void *p) {
 }
 
 static void print_err(const char *name, const err_stats &e) {
-    printf("  %-36s  max_abs=%10.4g  mean_abs=%10.4g  rmse=%10.4g\n",
-           name, e.max_abs, e.mean_abs, e.rmse);
+    printf("  %-36s  abs: max=%10.4g mean=%10.4g rmse=%10.4g  |  "
+           "rel%%: max=%7.3f mean=%7.3f rmse=%7.3f\n",
+           name, e.max_abs, e.mean_abs, e.rmse,
+           100.0 * e.max_rel, 100.0 * e.mean_rel, 100.0 * e.rmse_rel);
 }
 
 int main(int argc, char **argv) {
@@ -498,6 +511,7 @@ int main(int argc, char **argv) {
     snprintf(label_sameq, sizeof(label_sameq), "kquant packed %s (same Q)", quant_name(q_ty));
 
     printf("\n[1] vs fp32 GEMV (same W,y):\n");
+    printf("  (rel = |pred-ref|/max(|ref|,1e-8); rel%% = 100*rel)\n");
     print_err(label_base, diff_stats(h_base_o.data(), h_fp.data(), N));
     print_err(label_sameq, diff_stats(h_sameq_o.data(), h_fp.data(), N));
     print_err("SPEED mode1 Q-only", diff_stats(h_m1o.data(), h_fp.data(), N));
@@ -548,10 +562,11 @@ int main(int argc, char **argv) {
 
     const err_stats eq = diff_stats(h_m1o.data(), h_sameq_o.data(), N);
     if (eq.max_abs > 1e-3)
-        printf("WARNING: mode1 vs packed same-Q max_abs=%.4g (expected ~0 — layout/math bug?)\n",
-               eq.max_abs);
+        printf("WARNING: mode1 vs packed same-Q max_abs=%.4g rel%%=%.4g (expected ~0)\n",
+               eq.max_abs, 100.0 * eq.max_rel);
     else
-        printf("OK: mode1 matches packed same-Q (max_abs=%.4g)\n", eq.max_abs);
+        printf("OK: mode1 matches packed same-Q (max_abs=%.4g  max_rel%%=%.4g)\n",
+               eq.max_abs, 100.0 * eq.max_rel);
 
     cudaFree(d_W); cudaFree(d_yf); cudaFree(d_y);
     if (d_q8) cudaFree(d_q8);
