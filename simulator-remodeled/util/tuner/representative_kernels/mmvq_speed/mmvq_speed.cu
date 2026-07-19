@@ -1,5 +1,6 @@
 // SPEED Q||R strip GEMV prototype (modes 1 / 2). Sibling of mmvq_kquant — do not merge.
-// Layout per row: [ QxG | RxG ] [ QxG | RxG ] ...  G in {1,2,4,8}, group = 256 (QK_K).
+// Layout per row: [ QxG | RxG ] [ QxG | RxG ] ...  G >= 1 (e.g. 1..64+), group = 256 (QK_K).
+// Constraint: K must be divisible by G*256 (e.g. G=64 => K multiple of 16384).
 //   mode 1: Q-only GEMV (skip R gaps) — compare layout tax vs packed mmvq_kquant
 //   mode 2: SW rebuild  acc += dot(Q,y)+dot(R,y)  — dequant-space W_hat = Q+R
 //   mode 3: HW FR rebuild — CUDA is plain Q8; only meaningful under the simulator (stub).
@@ -484,8 +485,8 @@ static size_t q_only_touch_bytes(int K, int N, int G, quant_type q) {
 
 static int run_one(int mode, int G, quant_type q_ty, quant_type r_ty,
                    int K, int N, const char *label, bool verify, bool timeit) {
-    if (G != 1 && G != 2 && G != 4 && G != 8) {
-        printf("G=%d must be 1,2,4, or 8\n", G);
+    if (G < 1) {
+        printf("G=%d must be >= 1\n", G);
         return 1;
     }
     if (N <= 0) {
@@ -623,7 +624,7 @@ static void usage(const char *argv0) {
     printf("  %s <mode> <G> <q> <r> <K> <N>\n", argv0);
     printf("  %s <mode> <G> <q> <r> <8b|14b> <op|all>\n", argv0);
     printf("  mode: 1=Q-only  2=SW Q+R rebuild  3=Q8 stand-in (FR=sim-only)\n");
-    printf("  G: 1|2|4|8     q,r: q2_k|q3_k|q4_k\n");
+    printf("  G: >=1 (e.g. 1,2,4,8,16,32,64)  K %% (G*256)==0;  q,r: q2_k|q3_k|q4_k\n");
     printf("Compare packed baseline: ../mmvq_kquant/mmvq_kquant <K> <N> <q>\n");
 }
 

@@ -14,18 +14,24 @@ dst[N] = W[N×K] · y[K]     y = q8_1 (same as mmvq_kquant)
 
 One **group** = **256** weights (`QK_K`), stored as one ggml K-quant block (`Q2_K` / `Q3_K` / `Q4_K`).
 
-Pack **G ∈ {1, 2, 4, 8}** groups per strip:
+Pack **G ≥ 1** groups per strip (no hard cap — `1`, `8`, `64`, … all fine):
 
 ```text
 row:  [ Q×G | R×G ] [ Q×G | R×G ] …     # n_strips = K / (G·256)
 ```
 
-Example `G=4`, `K=4096`: each strip is **1024** Q weights then **1024** R weights; 4 strips per row.
+Examples:
 
-| Why G > 1 | Longer sequential Q (then R) run → better row-buffer / burst utilization |
-|-----------|--------------------------------------------------------------------------|
+| G | Q (then R) run | Needs `K % (G·256) == 0` | e.g. ok at |
+|---|----------------|---------------------------|------------|
+| 4 | 1024 elems | `K % 1024 == 0` | K=4096 → 4 strips |
+| 16 | 4096 elems | `K % 4096 == 0` | K=4096 → **1** strip (whole row one Q then one R) |
+| 64 | 16384 elems | `K % 16384 == 0` | K=16384, 32768, … (not 4096) |
 
-`K` must be divisible by `G * 256`. Q and R types are chosen independently (`q2_k` / `q3_k` / `q4_k`).
+| Why larger G | Longer sequential Q (then R) run → better row-buffer / burst utilization |
+|--------------|--------------------------------------------------------------------------|
+
+Only real constraint: **`K` divisible by `G * 256`**. Q and R types are chosen independently (`q2_k` / `q3_k` / `q4_k`).
 
 Address of Q-block `sb` (superblock index `0 .. K/256 - 1`) on a row:
 
