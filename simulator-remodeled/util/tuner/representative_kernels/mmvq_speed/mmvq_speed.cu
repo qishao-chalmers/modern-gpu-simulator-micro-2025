@@ -626,8 +626,10 @@ static void usage(const char *argv0) {
     printf("  mode: 1=Q-only  2=SW Q+R rebuild  3=Q8 stand-in (FR=sim-only)\n");
     printf("  G: >=1 (e.g. 1,2,4,8,16,32,64)  K %% (G*256)==0;  q,r: q2_k|q3_k|q4_k\n");
     printf("Compare packed baseline: ../mmvq_kquant/mmvq_kquant <K> <N> <q>\n");
+    printf("Error+speed harness:     make test_compare && ./test_compare ...\n");
 }
 
+#ifndef MMVQ_NO_MAIN
 int main(int argc, char **argv) {
     int dev = 0;
     cudaDeviceProp p;
@@ -686,3 +688,4 @@ int main(int argc, char **argv) {
     }
     return run_one(mode, G, q_ty, r_ty, K, N, op, true, timeit);
 }
+#endif // MMVQ_NO_MAIN

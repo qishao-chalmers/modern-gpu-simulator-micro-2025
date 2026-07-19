@@ -473,6 +473,7 @@ static void usage(const char *argv0) {
     printf("  op: q_proj k_proj v_proj o_proj gate up down lm_head | all\n");
 }
 
+#ifndef MMVQ_NO_MAIN
 int main(int argc, char **argv) {
     int dev = 0;
     cudaDeviceProp p;
@@ -527,3 +528,4 @@ int main(int argc, char **argv) {
     }
     return run_one(K, N, q, op, true, !getenv("MMVQ_NO_TIME"));
 }
+#endif // MMVQ_NO_MAIN

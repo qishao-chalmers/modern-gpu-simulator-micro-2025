@@ -13,5 +13,9 @@ exec: mmvq_speed.cu
 	  -gencode arch=compute_70,code=sm_70 -gencode arch=compute_70,code=compute_70 \
 	  --cudart shared -I.. mmvq_speed.cu -o mmvq_speed_exec
 
+# Shared-init error + speed: Q8 (=kquant q8_0) vs SPEED mode1/mode2
+test_compare: test_compare.cu mmvq_speed.cu
+	$(NVCC) $(NVCCFLAGS) -I.. test_compare.cu -o test_compare
+
 clean:
-	rm -f mmvq_speed mmvq_speed_exec
+	rm -f mmvq_speed mmvq_speed_exec test_compare

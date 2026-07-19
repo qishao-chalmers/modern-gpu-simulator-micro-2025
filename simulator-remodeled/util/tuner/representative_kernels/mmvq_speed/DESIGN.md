@@ -114,9 +114,33 @@ make exec       # FUNCSIM_SAFE -> mmvq_speed_exec
 MMVQ_NO_TIME=1 MMVQ_SKIP_FILL=1 MMVQ_TINY=1
 ```
 
+## Compare harness (`test_compare`)
+
+Separate binary — does **not** rewrite kernel logic. `#include`s `mmvq_speed.cu` with
+`MMVQ_NO_MAIN` and runs one shared `W`/`y` through:
+
+| Path | Meaning |
+|------|---------|
+| fp32 GEMV | numeric reference |
+| Q8_0 packed (`mmvq_q8_packed`) | same math as `../mmvq_kquant/mmvq_kquant K N q8_0` |
+| SPEED mode 1 | striped Q-only |
+| SPEED mode 2 | striped Q+R rebuild |
+
+Reports **max/mean/RMSE** error (vs fp32 and vs Q8) and **µs / GB/s**.
+
+```bash
+make test_compare
+./test_compare 8 q4_k q4_k 8192 8192
+MMVQ_SEED=42 ./test_compare 8 q4_k q4_k 1024 256
+```
+
+(Linking `mmvq_kquant.cu` and `mmvq_speed.cu` in one binary clashes on fill kernels /
+types; the Q8 kernel here is the intentional stand-in for kquant Q8_0.)
+
 ## Status
 
 - [x] Layout + modes 1 / 2 CUDA prototype
 - [x] DESIGN + CLI comparable to `mmvq_kquant`
+- [x] `test_compare` shared-init error + speed harness
 - [ ] Mode 3 sim hooks (dual region + FR latency + Q8 GEMV binary)
 - [ ] Optional: INT8 saturate rebuild in mode 2 to match FR RTL bit-exact
