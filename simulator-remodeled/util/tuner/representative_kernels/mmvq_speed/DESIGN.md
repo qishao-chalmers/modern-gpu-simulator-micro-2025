@@ -140,10 +140,18 @@ Reports:
 MMVQ_SEED=42 ./test_compare 8 q4_k q4_k q8_0 1024 256
 ```
 
+## Mode 3 (simulator FR) — done in official Accel-Sim
+
+See [`accel-sim-framework-official/SPEED_MODE3.md`](../../../../../../accel-sim-framework-official/SPEED_MODE3.md).
+
+- CUDA: `./mmvq_speed_exec 3 ...` → packed Q8 (`mmvq_q8_packed`); weights via `cudaMallocWeight` under `FUNCSIM_SAFE`.
+- Sim: `QWC_Q_BITS` + `QWC_R_BITS` → dual DRAM fetch; `QWC_FR_LATENCY` → FR hold + rebuild; stats `fr_hold_peak`.
+
 ## Status
 
 - [x] Layout + modes 1 / 2 CUDA prototype
 - [x] DESIGN + CLI comparable to `mmvq_kquant`
 - [x] `test_compare` shared-init error + speed harness
-- [ ] Mode 3 sim hooks (dual region + FR latency + Q8 GEMV binary)
+- [x] Mode 3 sim hooks (`cudaMallocWeight`, dual Q/R, FR hold) in official tree
 - [ ] Optional: INT8 saturate rebuild in mode 2 to match FR RTL bit-exact
+- [ ] Optional: hard FR buffer depth backpressure

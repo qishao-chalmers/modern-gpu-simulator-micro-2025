@@ -52,6 +52,27 @@ enum run_mode   { MODE_Q_ONLY = 1, MODE_SW_REBUILD = 2, MODE_HW_FR = 3 };
 
 #define CHECK(x) do { cudaError_t e=(x); if(e){printf("CUDA error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); return 1;} } while(0)
 
+// Weight alloc: under GPGPU-Sim, mark the region for Mode3/QWC. Provide the symbol in
+// this TU so `make exec` links against stock --cudart shared; the sim lib's
+// gpgpuSimMarkWeightRegion is resolved weakly at runtime when LD_LIBRARY_PATH
+// points at the patched libcudart.
+#ifdef FUNCSIM_SAFE
+extern "C" void gpgpuSimMarkWeightRegion(void *ptr, size_t size) __attribute__((weak));
+extern "C" cudaError_t cudaMallocWeight(void **devPtr, size_t size) {
+    cudaError_t e = cudaMalloc(devPtr, size);
+    if (e == cudaSuccess && devPtr && *devPtr && gpgpuSimMarkWeightRegion)
+        gpgpuSimMarkWeightRegion(*devPtr, size);
+    return e;
+}
+static inline cudaError_t mmvq_malloc_weight(void **p, size_t n) {
+    return cudaMallocWeight(p, n);
+}
+#else
+static inline cudaError_t mmvq_malloc_weight(void **p, size_t n) {
+    return cudaMalloc(p, n);
+}
+#endif
+
 #ifndef FUNCSIM_SAFE
 static __device__ __forceinline__ int load_int(const int8_t *p) {
     const uint16_t *p16 = reinterpret_cast<const uint16_t *>(p);
@@ -519,7 +540,7 @@ static int run_one(int mode, int G, quant_type q_ty, quant_type r_ty,
                "see DESIGN.md). Compare traffic under sim, not this host timer alone.\n");
         const size_t n = (size_t)N * (K / QK8_0);
         block_q8_0 *d_w = nullptr;
-        CHECK(cudaMalloc(&d_w, n * sizeof(block_q8_0)));
+        CHECK(mmvq_malloc_weight((void **)&d_w, n * sizeof(block_q8_0)));
         if (!skip_fill) fill_q8_0<<<(n + 255) / 256, 256>>>(d_w, n);
         CHECK(cudaGetLastError());
 
@@ -564,7 +585,7 @@ static int run_one(int mode, int G, quant_type q_ty, quant_type r_ty,
     const size_t r_touch = (size_t)N * (size_t)(K / QK_K) * quant_block_bytes(r_ty);
 
     char *d_w = nullptr;
-    CHECK(cudaMalloc(&d_w, w_bytes));
+    CHECK(mmvq_malloc_weight((void **)&d_w, w_bytes));
     if (!skip_fill) {
         const size_t n_q = (size_t)N * (size_t)n_strips * (size_t)G;
         fill_striped<<<(unsigned)((n_q + 255) / 256), 256>>>(
