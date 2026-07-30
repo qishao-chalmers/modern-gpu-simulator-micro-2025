@@ -1,4 +1,4 @@
-# mmvq_kquant — decode GEMV only (Q8_0 / Q4_K / Q2_K)
+# mmvq_kquant — decode GEMV only (Q8_0 / Q4_K / Q3_K_M / Q2_K)
 
 ## Goal
 
@@ -8,7 +8,7 @@ Simulate **one** llama.cpp decode matvec (`mul_mat_vec_q`) under Accel-Sim / GPG
 dst[N] = W[N×K] · y[K]
 ```
 
-- `W`: Q8_0, Q4_K, or Q2_K (ggml block layouts)
+- `W`: Q8_0, Q4_K, Q3_K_M, or Q2_K (ggml block layouts)
 - `y`: q8_1 activations
 - **No** layer assembly, attention, RMSNorm, etc.
 
@@ -20,6 +20,7 @@ Primary study shape: **K=4096, N=4096** (Qwen3-8B `q_proj` / `o_proj`).
 |------|------------|---------------|-----------------------------|
 | Q8_0 | 34 B (native) / 36 B (FUNCSIM_SAFE f32) | 32 | ~1.06–1.125 B |
 | Q4_K | 144 B / ~148 B FUNCSIM | 256 | ~0.56 B |
+| Q3_K_M (`block_q3_K`) | 110 B / ~112 B FUNCSIM | 256 | ~0.43–0.44 B |
 | Q2_K | 84 B / ~88 B FUNCSIM | 256 | ~0.33 B |
 
 For 4096×4096:
@@ -45,9 +46,9 @@ Expected bandwidth-bound speedup ≈ **weight-byte ratio** (~3× Q8→Q2) if com
 **CLI:**
 
 ```bash
-./mmvq_kquant_exec <K> <N> <q8_0|q4_k|q2_k>
+./mmvq_kquant_exec <K> <N> <q8_0|q4_k|q3_k_m|q2_k>
 ./mmvq_kquant_exec 8b q_proj q2_k
-./mmvq_kquant_exec 14b all q4_k
+./mmvq_kquant_exec 14b all q3_k_m
 ```
 
 **Env:**

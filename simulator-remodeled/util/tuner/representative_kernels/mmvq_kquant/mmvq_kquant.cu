@@ -1,11 +1,12 @@
 // Decode GEMV only: mul_mat_vec_q-style weight [N x K] x activation [K] -> dst[N].
-// Supports real ggml block layouts for Q8_0, Q4_K, Q2_K (llama.cpp decode path).
+// Supports real ggml block layouts for Q8_0, Q4_K, Q3_K/Q3_K_M, Q2_K
+// (llama.cpp decode path).
 // No layer assembly — one matvec launch per (K, N, quant) tuple.
 //
 // Build:  make            (sm_90, dp4a/fp16)
 //         make exec       (sm_70 + PTX, FUNCSIM_SAFE for GPGPU-Sim execution-driven)
 // Run:    ./mmvq_kquant 14b q_proj q4_k
-//         ./mmvq_kquant 8b all q2_k
+//         ./mmvq_kquant 8b all q3_k_m
 //         ./mmvq_kquant 4096 5120 q8_0     (explicit K N quant)
 
 #include <cstdio>
@@ -338,7 +339,7 @@ static const char *quant_name(quant_type q) {
     switch (q) {
         case QUANT_Q8_0: return "q8_0";
         case QUANT_Q4_K: return "q4_k";
-        case QUANT_Q3_K: return "q3_k";
+        case QUANT_Q3_K: return "q3_k_m";
         case QUANT_Q2_K: return "q2_k";
     }
     return "?";
@@ -348,7 +349,11 @@ static int parse_quant(const char *s, quant_type *q) {
     if (!s) return -1;
     if (strcmp(s, "q8_0") == 0 || strcmp(s, "Q8_0") == 0) { *q = QUANT_Q8_0; return 0; }
     if (strcmp(s, "q4_k") == 0 || strcmp(s, "Q4_K") == 0) { *q = QUANT_Q4_K; return 0; }
-    if (strcmp(s, "q3_k") == 0 || strcmp(s, "Q3_K") == 0) { *q = QUANT_Q3_K; return 0; }
+    if (strcmp(s, "q3_k") == 0 || strcmp(s, "Q3_K") == 0 ||
+        strcmp(s, "q3_k_m") == 0 || strcmp(s, "Q3_K_M") == 0) {
+        *q = QUANT_Q3_K;
+        return 0;
+    }
     if (strcmp(s, "q2_k") == 0 || strcmp(s, "Q2_K") == 0) { *q = QUANT_Q2_K; return 0; }
     return -1;
 }
@@ -467,8 +472,8 @@ static int run_one(int K, int N, quant_type q, const char *label, bool verify, b
 
 static void usage(const char *argv0) {
     printf("Usage:\n");
-    printf("  %s <model> <op|all> <q8_0|q4_k|q2_k>\n", argv0);
-    printf("  %s <K> <N> <q8_0|q4_k|q2_k>\n", argv0);
+    printf("  %s <model> <op|all> <q8_0|q4_k|q3_k_m|q2_k>\n", argv0);
+    printf("  %s <K> <N> <q8_0|q4_k|q3_k_m|q2_k>\n", argv0);
     printf("  model: 8b | 14b\n");
     printf("  op: q_proj k_proj v_proj o_proj gate up down lm_head | all\n");
 }
@@ -478,7 +483,7 @@ int main(int argc, char **argv) {
     int dev = 0;
     cudaDeviceProp p;
     CHECK(cudaGetDeviceProperties(&p, dev));
-    printf("Device: %s  (decode GEMV only: Q8_0 / Q4_K / Q2_K)\n", p.name);
+    printf("Device: %s  (decode GEMV only: Q8_0 / Q4_K / Q3_K_M / Q2_K)\n", p.name);
 
 #ifdef FUNCSIM_SAFE
     printf("Build: FUNCSIM_SAFE (execution-driven / GPGPU-Sim)\n");
