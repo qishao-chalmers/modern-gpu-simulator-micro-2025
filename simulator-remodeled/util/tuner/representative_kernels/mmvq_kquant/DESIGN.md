@@ -1,15 +1,15 @@
-# mmvq_kquant — decode GEMV only (Q8_0 / Q4_K / Q3_K_M / Q2_K)
+# mmvq_kquant — decode GEMV / small-batch multi-vector (Q8_0 / Q4_K / Q3_K_M / Q2_K)
 
 ## Goal
 
-Simulate **one** llama.cpp decode matvec (`mul_mat_vec_q`) under Accel-Sim / GPGPU-Sim and compare **weight quant** speedup:
+Simulate llama.cpp decode matvec (`mul_mat_vec_q`) under Accel-Sim / GPGPU-Sim and compare **weight quant** speedup:
 
 ```
-dst[N] = W[N×K] · y[K]
+dst[N×B] = W[N×K] · Y[K×B]
 ```
 
 - `W`: Q8_0, Q4_K, Q3_K_M, or Q2_K (ggml block layouts)
-- `y`: q8_1 activations
+- `Y`: q8_1 activations (`B=1` is the original decode GEMV; `B>1` is a small batched multi-vector extension)
 - **No** layer assembly, attention, RMSNorm, etc.
 
 Primary study shape: **K=4096, N=4096** (Qwen3-8B `q_proj` / `o_proj`).
@@ -46,9 +46,9 @@ Expected bandwidth-bound speedup ≈ **weight-byte ratio** (~3× Q8→Q2) if com
 **CLI:**
 
 ```bash
-./mmvq_kquant_exec <K> <N> <q8_0|q4_k|q3_k_m|q2_k>
+./mmvq_kquant_exec <K> <N> <q8_0|q4_k|q3_k_m|q2_k> [batch]
 ./mmvq_kquant_exec 8b q_proj q2_k
-./mmvq_kquant_exec 14b all q3_k_m
+./mmvq_kquant_exec 14b all q3_k_m 8
 ```
 
 **Env:**
@@ -58,13 +58,65 @@ Expected bandwidth-bound speedup ≈ **weight-byte ratio** (~3× Q8→Q2) if com
 | `MMVQ_NO_TIME=1` | skip CUDA events (sim) |
 | `MMVQ_SKIP_FILL=1` | skip fill kernels — **required for large K×N under GPGPU-Sim** (fill OOM/kills) |
 | `MMVQ_TINY=1` | tiny shape only |
+| `BATCH=8` | optional fallback if CLI batch arg is omitted |
+| `MMVQ_FORCE_MULTI=1` | keep register-MMVQ for all `B>1` (skip smem MMQ) |
 
-**Accel-Sim runner:**  
-`accel-sim-framework-official/result/mmvq_kquant_4096/run.sh`  
-Uses mem-bound QV100 config from `result/qwc_dp4a_gemv/`.
+**Kernel dispatch** (mirrors llama.cpp `mmvq.cuh` / `mmq.cuh`, dp4a-only here):
 
-Metric: `gpu_tot_sim_cycle` for kernel `_Z9mmvq_gemvIL10quant_type…`  
-(`0`=Q8_0, `1`=Q4_K, `2`=Q2_K), not fill kernels.
+| batch | path | tag |
+|-------|------|-----|
+| `B=1` | `mmvq_gemv_single` — one CTA/row, stream K | `[gemv]` |
+| `2 ≤ B ≤ 32` | `mmvq_gemv_ncols` — same CTA map; W packed in regs, reused across ncols | `[mmvq]` |
+| `B > 32` (Q8_0) | `mmq_q8_tiled` — BM=32×BN=64 smem tiles, `WPB+1` bank pad | `[mmq]` |
+
+llama.cpp switches MMVQ→MMQ at **B>8** and uses **tensor-core MMA** in MMQ. Our dp4a MMQ only wins on absolute time once `B>32`, so `MMQ_SWITCH_BATCH=32`.
+
+## H100 native: batch scaling (2026-07-30)
+
+Shape: **K=8192, N=16384, q8_0**, W ≈ 142.6 MB. Device: NVIDIA H100.
+
+| B | path | latency | notes |
+|---|------|---------|-------|
+| 1 | gemv | **96.8 µs** | ~1.47 TB/s on W — HBM-bound |
+| 8 | mmvq | 156 µs | ~1.6× B=1 |
+| 16 | mmvq | 267 µs | |
+| 32 | mmvq | 543 µs | roughly linear in B from 16→32 |
+| 64 | mmq | **1149 µs** | smem tile; ~flat vs forcing mmq at B=16–64 (~1.0–1.15 ms) |
+| 128 | mmq | 2271 µs | 2× BN=64 batch tiles → ~2× B=64 |
+
+Forced comparisons (same shape):
+
+| B | `[mmvq]` (FORCE_MULTI) | `[mmq]` |
+|---|------------------------|---------|
+| 16 | **267 µs** | 1028 µs |
+| 64 | 1184 µs | **1149 µs** |
+
+So MMQ flattens the **large-B** curve but is slower than register-MMVQ for mid batch — hence the B>32 switch.
+
+### Why B=16…64 still grew on the GEMV/MMVQ path
+
+1. **Not missing W reuse.** One-pass `ncols=64` (single W DRAM pass) still tracks ~linear time → past ~B=8 the kernel is **dp4a compute-bound** (and y traffic), not W re-fetch.
+2. **Shared-memory GEMM alone does not restore B=1 latency.** Early BM×BN tile kernels made B=1 ~6× slower (~572 µs) by changing the CTA map; we kept GEMV for B=1.
+3. **llama.cpp’s flat large-batch curve needs MMA (or cuBLAS).** Their MMQ uses tensor-core int8 MMA after `MMVQ_MAX_BATCH_SIZE=8`; on H100 they may hand `ne11≥64` to cuBLAS. Our MMQ is a **dp4a traffic-faithful** stand-in — flat across B when used, but ~1 ms floor on this shape, not ~100 µs.
+
+Bank-conflict swizzling / vector loads: reduction smem is tiny on MMVQ; MMQ uses `WPB+1` pad (llama-style). Neither closes the B=1→B=16 gap on the GEMV map.
+
+### Gap vs goal
+
+| goal | status |
+|------|--------|
+| Keep B=1 ≈ historical GEMV (~97 µs on this shape) | **done** |
+| B=2…8 ≈ B=1 via W reuse | **mostly** (~1.6× at B=8) |
+| B=16…64 ≈ B=1 (classic “tile A/B, reuse W”) | **not with dp4a GEMV**; MMQ flattens B but at ~1.1 ms, not ~0.1 ms |
+| Match llama large-B absolute speed | **gap** — need MMA MMQ (or cuBLAS reference) |
+
+### Plan
+
+1. **Native H100:** add an optional **tensor-core MMA** MMQ path (or thin cuBLAS/cublasLt reference) for `B>8`, matching llama’s dispatch so B=16…64 stay near the MMA floor instead of the dp4a ~1 ms floor.
+2. **Keep dp4a MMQ** as the Accel-Sim / `FUNCSIM_SAFE` representative (no MMA): traffic + bank-pad layout; document that absolute µs will not match MMA.
+3. **K-quants (`q4_k` / `q3_k_m` / `q2_k`):** still MMVQ-style for all B; add smem MMQ variants only if batch study needs them.
+4. **Update this table** after MMA (or cuBLAS) numbers land on the same K/N/q8_0 shape.
+5. **Sim:** continue `MMVQ_SKIP_FILL=1` + protobuf/execution-driven runs; compare `gpu_tot_sim_cycle` across quants at fixed B.
 
 ## Caveats (why 4096×4096 failed / was cancelled)
 
